@@ -19,8 +19,11 @@ def test(model, test_loader, evaluator, exp_root, cfg, view, epoch, max_batches=
         logging.info("Starting testing.")
 
     # Test the model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if epoch > 0:
-        model.load_state_dict(torch.load(os.path.join(exp_root, "models", "model_{:03d}.pt".format(epoch)), map_location='cpu')['model'])
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.load_state_dict(torch.load(os.path.join(exp_root, "models", "model_{:03d}.pt".format(epoch)), map_location=device)['model'])
+
 
 
     model.eval()

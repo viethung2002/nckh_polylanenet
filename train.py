@@ -30,14 +30,19 @@ def save_train_state(path, model, optimizer, lr_scheduler, epoch):
 # Hàm load checkpoint để tiếp tục huấn luyện
 # Hàm load checkpoint để tiếp tục huấn luyện
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
-    checkpoint = torch.load(checkpoint_path)  # Thay 'torch.load_state_dict' bằng 'torch.load'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # checkpoint = torch.load(checkpoint_path)  # Thay 'torch.load_state_dict' bằng 'torch.load'
     # print(type(checkpoint))  # In ra kiểu dữ liệu của checkpoint
     # print(checkpoint)  # In ra nội dung của checkpoint để kiểm tra cấu trúc
 
     # Kiểm tra cấu trúc checkpoint
     if isinstance(checkpoint, dict):
-        # model.load_state_dict(checkpoint['model'])
-        model.load_state_dict(torch.load(os.path.join(exp_root, "models", "model_{:03d}.pt".format(epoch)), map_location='cpu')['model']) 
+        # load model với GPU
+        model.load_state_dict(checkpoint['model'])
+        # lode model với CPU
+        # model.load_state_dict(torch.load(os.path.join(exp_root, "models", "model_{:03d}.pt".format(epoch)), map_location='cpu')['model']) 
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['lr_scheduler'])
         epoch = checkpoint['epoch']
