@@ -10,7 +10,7 @@ model:
   parameters:
     num_outputs: 35 # (5 lanes) * (1 conf + 2 (upper & lower) + 4 poly coeffs)
     pretrained: true
-    backbone: 'efficientnet-b0'
+    backbone: 'shufflenet_v2_x0_5'
     pred_category: false
     curriculum_steps: [0, 0, 0, 0]
 loss_parameters:
@@ -29,6 +29,7 @@ lr_scheduler:
   name: CosineAnnealingLR
   parameters:
     T_max: 385
+checkpoint_save_interval: 205  # Lưu checkpoint mỗi 5 epoch
 
 # Testing settings
 test_parameters:
@@ -55,7 +56,7 @@ datasets:
          parameters:
            width: 1152
            height: 648
-      root: "../data_lane-regression/datasets/tusimple/TUSimple/train_set"
+      root: "../tusimple/TUSimple/train_set"
 
   test: &test
     type: LaneDataset
@@ -64,7 +65,7 @@ datasets:
       split: val
       max_lanes: 5
       img_size: [360, 640]
-      root: "../data_lane-regression/datasets/tusimple/TUSimple/train_set"
+      root: "../tusimple/TUSimple/train_set"
       normalize: true
       augmentations: []
 

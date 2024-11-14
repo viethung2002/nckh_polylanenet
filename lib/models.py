@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torchvision.models import resnet34, resnet50, resnet101
 from efficientnet_pytorch import EfficientNet
-
+from torchvision import models
 
 class OutputLayer(nn.Module):
     def __init__(self, fc, num_extra):
@@ -18,8 +18,22 @@ class OutputLayer(nn.Module):
             extra_outputs = self.extra_outputs_layer(x)
         else:
             extra_outputs = None
-
         return regular_outputs, extra_outputs
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, embed_size, heads):
+        super(SelfAttention, self).__init__()
+        self.embed_size = embed_size
+        self.heads = heads
+        self.attention = nn.MultiheadAttention(embed_dim=embed_size, num_heads=heads)
+        self.norm = nn.LayerNorm(embed_size)
+
+    def forward(self, value, key, query, mask=None):
+        attention_output, attention_weights = self.attention(query, key, value, attn_mask=mask)
+        output = self.norm(attention_output + query)  # Add residual connection
+        return output, attention_weights
+
 
 
 class PolyRegression(nn.Module):
@@ -30,8 +44,16 @@ class PolyRegression(nn.Module):
                  curriculum_steps=None,
                  extra_outputs=0,
                  share_top_y=True,
-                 pred_category=False):
+                 pred_category=False,
+                 attention_heads=5):
+                #  Điều chỉnh attention_heads sao cho chia hết cho num_outputs
         super(PolyRegression, self).__init__()
+
+        # Kiểm tra và điều chỉnh attention_heads sao cho num_outputs chia hết cho attention_heads num_outputs: 35
+        if num_outputs % attention_heads != 0:
+            raise ValueError(f"embed_size ({num_outputs}) must be divisible by num_heads ({attention_heads})")
+
+        # Khởi tạo mô hình backbone
         if 'efficientnet' in backbone:
             if pretrained:
                 self.model = EfficientNet.from_pretrained(backbone, num_classes=num_outputs)
@@ -39,20 +61,60 @@ class PolyRegression(nn.Module):
                 self.model = EfficientNet.from_name(backbone, override_params={'num_classes': num_outputs})
             self.model._fc = OutputLayer(self.model._fc, extra_outputs)
         elif backbone == 'resnet34':
-            self.model = resnet34(pretrained=pretrained)
+            self.model = models.resnet34(pretrained=pretrained)
             self.model.fc = nn.Linear(self.model.fc.in_features, num_outputs)
             self.model.fc = OutputLayer(self.model.fc, extra_outputs)
         elif backbone == 'resnet50':
-            self.model = resnet50(pretrained=pretrained)
+            self.model = models.resnet50(pretrained=pretrained)
             self.model.fc = nn.Linear(self.model.fc.in_features, num_outputs)
             self.model.fc = OutputLayer(self.model.fc, extra_outputs)
         elif backbone == 'resnet101':
-            self.model = resnet101(pretrained=pretrained)
+            self.model = models.resnet101(pretrained=pretrained)
+            self.model.fc = nn.Linear(self.model.fc.in_features, num_outputs)
+            self.model.fc = OutputLayer(self.model.fc, extra_outputs)
+        elif backbone == 'mobilenet_v2':
+            self.model = models.mobilenet_v2(pretrained=pretrained)
+            self.model.classifier[1] = nn.Linear(self.model.classifier[1].in_features, num_outputs)
+            self.model.classifier[1] = OutputLayer(self.model.classifier[1], extra_outputs)
+        elif backbone == 'mobilenet_v3_small':
+            self.model = models.mobilenet_v3_small(pretrained=pretrained)
+            self.model.classifier[3] = nn.Linear(self.model.classifier[3].in_features, num_outputs)
+            self.model.classifier[3] = OutputLayer(self.model.classifier[3], extra_outputs)
+        elif backbone == 'mobilenet_v3_large':
+            self.model = models.mobilenet_v3_large(pretrained=pretrained)
+            self.model.classifier[3] = nn.Linear(self.model.classifier[3].in_features, num_outputs)
+            self.model.classifier[3] = OutputLayer(self.model.classifier[3], extra_outputs)
+        elif backbone == 'squeezenet1_0':
+            self.model = models.squeezenet1_0(pretrained=pretrained)
+            self.model.classifier[1] = nn.Conv2d(512, num_outputs, kernel_size=(1, 1), stride=(1, 1))
+            self.model.classifier[1] = OutputLayer(self.model.classifier[1], extra_outputs)
+        elif backbone == 'squeezenet1_1':
+            self.model = models.squeezenet1_1(pretrained=pretrained)
+            self.model.classifier[1] = nn.Conv2d(512, num_outputs, kernel_size=(1, 1), stride=(1, 1))
+            self.model.classifier[1] = OutputLayer(self.model.classifier[1], extra_outputs)
+        elif backbone == 'shufflenet_v2_x0_5':
+            self.model = models.shufflenet_v2_x0_5(pretrained=pretrained)
+            self.model.fc = nn.Linear(self.model.fc.in_features, num_outputs)
+            self.model.fc = OutputLayer(self.model.fc, extra_outputs)
+        elif backbone == 'shufflenet_v2_x1_0':
+            self.model = models.shufflenet_v2_x1_0(pretrained=pretrained)
+            self.model.fc = nn.Linear(self.model.fc.in_features, num_outputs)
+            self.model.fc = OutputLayer(self.model.fc, extra_outputs)
+        elif backbone == 'shufflenet_v2_x1_5':
+            self.model = models.shufflenet_v2_x1_5(pretrained=pretrained)
+            self.model.fc = nn.Linear(self.model.fc.in_features, num_outputs)
+            self.model.fc = OutputLayer(self.model.fc, extra_outputs)
+        elif backbone == 'shufflenet_v2_x2_0':
+            self.model = models.shufflenet_v2_x2_0(pretrained=pretrained)
             self.model.fc = nn.Linear(self.model.fc.in_features, num_outputs)
             self.model.fc = OutputLayer(self.model.fc, extra_outputs)
         else:
             raise NotImplementedError()
 
+        # Cài đặt SelfAttention
+        self.attention = SelfAttention(embed_size=num_outputs, heads=attention_heads)
+
+        # Các tham số khác
         self.curriculum_steps = [0, 0, 0, 0] if curriculum_steps is None else curriculum_steps
         self.share_top_y = share_top_y
         self.extra_outputs = extra_outputs
@@ -61,6 +123,10 @@ class PolyRegression(nn.Module):
 
     def forward(self, x, epoch=None, **kwargs):
         output, extra_outputs = self.model(x, **kwargs)
+
+        # Áp dụng Self-Attention
+        output, _ = self.attention(output, output, output)
+
         for i in range(len(self.curriculum_steps)):
             if epoch is not None and epoch < self.curriculum_steps[i]:
                 output[:, -len(self.curriculum_steps) + i] = 0
@@ -74,9 +140,6 @@ class PolyRegression(nn.Module):
         outputs = outputs.reshape(len(outputs), -1, 7)  # score + upper + lower + 4 coeffs = 7
         outputs[:, :, 0] = self.sigmoid(outputs[:, :, 0])
         outputs[outputs[:, :, 0] < conf_threshold] = 0
-
-        if False and self.share_top_y:
-            outputs[:, :, 0] = outputs[:, 0, 0].expand(outputs.shape[0], outputs.shape[1])
 
         return outputs, extra_outputs
 

@@ -14,34 +14,73 @@ from test import test
 from lib.config import Config
 from utils.evaluator import Evaluator
 
+# Hàm lưu trạng thái huấn luyện (model, optimizer, lr_scheduler)
+def save_train_state(path, model, optimizer, lr_scheduler, epoch):
+    train_state = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'lr_scheduler': lr_scheduler.state_dict(),
+        'epoch': epoch
+    }
+    torch.save(train_state, path)
+    logging.info(f"Checkpoint saved at {path}")
 
+
+
+# Hàm load checkpoint để tiếp tục huấn luyện
+# Hàm load checkpoint để tiếp tục huấn luyện
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path)  # Thay 'torch.load_state_dict' bằng 'torch.load'
+    # print(type(checkpoint))  # In ra kiểu dữ liệu của checkpoint
+    # print(checkpoint)  # In ra nội dung của checkpoint để kiểm tra cấu trúc
+
+    # Kiểm tra cấu trúc checkpoint
+    if isinstance(checkpoint, dict):
+        # model.load_state_dict(checkpoint['model'])
+        model.load_state_dict(torch.load(os.path.join(exp_root, "models", "model_{:03d}.pt".format(epoch)), map_location='cpu')['model']) 
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        epoch = checkpoint['epoch']
+    else:
+        raise ValueError(f"Checkpoint at {checkpoint_path} không có cấu trúc hợp lệ!")
+
+    logging.info(f"Checkpoint loaded from {checkpoint_path}, starting from epoch {epoch}")
+    return model, optimizer, scheduler, epoch
+
+
+
+
+# Hàm huấn luyện model
+# Hàm huấn luyện model
 def train(model, train_loader, exp_dir, cfg, val_loader, train_state=None):
-    # Get initial train state
     optimizer = cfg.get_optimizer(model.parameters())
     scheduler = cfg.get_lr_scheduler(optimizer)
     starting_epoch = 1
 
+    # Nếu train_state không phải là None, load trạng thái huấn luyện từ checkpoint
     if train_state is not None:
-        model.load_state_dict(train_state['model'])
-        optimizer.load_state_dict(train_state['optimizer'])
-        scheduler.load_state_dict(train_state['lr_scheduler'])
-        starting_epoch = train_state['epoch'] + 1
+        model = train_state[0]  # load model từ checkpoint
+        optimizer = train_state[1]  # load optimizer từ checkpoint
+        scheduler = train_state[2]  # load scheduler từ checkpoint
+        starting_epoch = train_state[3] + 1  # Epoch sẽ bắt đầu từ tiếp theo
         scheduler.step(starting_epoch)
 
-    # Train the model
+    # Cấu hình và tham số huấn luyện
     criterion_parameters = cfg.get_loss_parameters()
     criterion = model.loss
     total_step = len(train_loader)
     ITER_LOG_INTERVAL = cfg['iter_log_interval']
     ITER_TIME_WINDOW = cfg['iter_time_window']
     MODEL_SAVE_INTERVAL = cfg['model_save_interval']
+    CHECKPOINT_SAVE_INTERVAL = cfg['checkpoint_save_interval']
     t0 = time()
     total_iter = 0
     iter_times = []
     logging.info("Starting training.")
+    
     for epoch in range(starting_epoch, num_epochs + 1):
         epoch_t0 = time()
-        logging.info("Beginning epoch {}".format(epoch))
+        logging.info(f"Beginning epoch {epoch}")
         accum_loss = 0
         for i, (images, labels, img_idxs) in enumerate(train_loader):
             total_iter += 1
@@ -65,20 +104,20 @@ def train(model, train_loader, exp_dir, cfg, val_loader, train_state=None):
             if (i + 1) % ITER_LOG_INTERVAL == 0:
                 loss_str = ', '.join(
                     ['{}: {:.4f}'.format(loss_name, loss_dict_i[loss_name]) for loss_name in loss_dict_i])
-                logging.info("Epoch [{}/{}], Step [{}/{}], Loss: {:.4f} ({}), s/iter: {:.4f}, lr: {:.1e}".format(
-                    epoch,
-                    num_epochs,
-                    i + 1,
-                    total_step,
-                    accum_loss / (i + 1),
-                    loss_str,
-                    np.mean(iter_times),
-                    optimizer.param_groups[0]["lr"],
-                ))
-        logging.info("Epoch time: {:.4f}".format(time() - epoch_t0))
+                logging.info(f"Epoch [{epoch}/{num_epochs}], Step [{i+1}/{total_step}], Loss: {accum_loss / (i+1):.4f} ({loss_str}), s/iter: {np.mean(iter_times):.4f}, lr: {optimizer.param_groups[0]['lr']:.1e}")
+
+            # Lưu checkpoint
+            if total_iter % CHECKPOINT_SAVE_INTERVAL == 0:
+                checkpoint_path = os.path.join(exp_dir, "models", f"checkpoint_{total_iter:07d}.pt")
+                save_train_state(checkpoint_path, model, optimizer, scheduler, epoch)
+
+        logging.info(f"Epoch time: {time() - epoch_t0:.4f}")
+
+        # Lưu model sau mỗi epoch
         if epoch % MODEL_SAVE_INTERVAL == 0 or epoch == num_epochs:
-            model_path = os.path.join(exp_dir, "models", "model_{:03d}.pt".format(epoch))
+            model_path = os.path.join(exp_dir, "models", f"model_{epoch:03d}.pt")
             save_train_state(model_path, model, optimizer, scheduler, epoch)
+
         if val_loader is not None:
             evaluator = Evaluator(val_loader.dataset, exp_root)
             evaluator, val_loss = test(
@@ -92,23 +131,16 @@ def train(model, train_loader, exp_dir, cfg, val_loader, train_state=None):
                 verbose=False,
             )
             _, results = evaluator.eval(label=None, only_metrics=True)
-            logging.info("Epoch [{}/{}], Val loss: {:.4f}".format(epoch, num_epochs, val_loss))
+            logging.info(f"Epoch [{epoch}/{num_epochs}], Val loss: {val_loss:.4f}")
             model.train()
+
         scheduler.step()
-    logging.info("Training time: {:.4f}".format(time() - t0))
+
+    logging.info(f"Training time: {time() - t0:.4f}")
 
     return model
 
 
-def save_train_state(path, model, optimizer, lr_scheduler, epoch):
-    train_state = {
-        'model': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'lr_scheduler': lr_scheduler.state_dict(),
-        'epoch': epoch
-    }
-
-    torch.save(train_state, path)
 
 
 def parse_args():
@@ -147,16 +179,34 @@ def setup_exp_dir(exps_dir, exp_name, cfg_path):
     return exp_root
 
 
+# Hàm lấy trạng thái huấn luyện từ checkpoint
 def get_exp_train_state(exp_root):
     models_dir = os.path.join(exp_root, "models")
-    models = os.listdir(models_dir)
+    models = [name for name in os.listdir(models_dir) if name.endswith(".pt")]
+    
+    if not models:
+        logging.warning("No checkpoint found!")
+        return None
+
+    # Sắp xếp và chọn checkpoint có epoch cao nhất
     last_epoch, last_modelname = sorted(
         [(int(name.split("_")[1].split(".")[0]), name) for name in models],
         key=lambda x: x[0],
     )[-1]
-    train_state = torch.load(os.path.join(models_dir, last_modelname))
+    
+    checkpoint_path = os.path.join(models_dir, last_modelname)
+    model = cfg.get_model().to(device)  # Khởi tạo model trước khi load
+    optimizer = cfg.get_optimizer(model.parameters())  # Khởi tạo optimizer
+    scheduler = cfg.get_lr_scheduler(optimizer)  # Khởi tạo scheduler
 
-    return train_state
+    # Load checkpoint vào model, optimizer, scheduler
+    model, optimizer, scheduler, epoch = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+    
+    logging.info(f"Loaded train state from {checkpoint_path} (epoch {epoch})")
+    
+    return model, optimizer, scheduler, epoch
+
+
 
 
 def log_on_exception(exc_type, exc_value, exc_traceback):
@@ -243,6 +293,7 @@ if __name__ == "__main__":
         subprocess.run(['rclone', 'copy', exp_root, '{}/{}'.format(cfg['backup'], args.exp_name)])
 
     # Eval model after training
+    # Eval model after training
     test_dataset = cfg.get_dataset("test")
 
     test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
@@ -261,11 +312,15 @@ if __name__ == "__main__":
         ],
     )
     logging.info('Code state:\n {}'.format(get_code_state()))
+    
+    # Tiến hành đánh giá mô hình trên dữ liệu test
     _, mean_loss = test(model, test_loader, evaluator, exp_root, cfg, epoch=test_epoch, view=False)
     logging.info("Mean test loss: {:.4f}".format(mean_loss))
 
-    evaluator.exp_name = args.exp_name
+    evaluator.exp_name = args.exp_name  # Lưu tên experiment
 
+    # Đánh giá mô hình và ghi kết quả
     eval_str, _ = evaluator.eval(label='{}_{}'.format(os.path.basename(args.exp_name), test_epoch))
 
-    logging.info(eval_str)
+    logging.info(eval_str)  # In kết quả đánh giá ra log
+

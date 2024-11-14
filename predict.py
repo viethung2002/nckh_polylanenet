@@ -95,7 +95,7 @@ def draw_annotation(pred=None, img=None, cls_pred=None):
     return img
 
 
-def predict_on_image(model, image, test_parameters, save=False, device="cpu"):
+def predict_on_image(model, image, test_parameters, save=False, device="cuda:0"):
     # image = cv2.resize(image, (640, 360))
     input_image = normalize_image_for_test(image).unsqueeze(0).to(device)
 
@@ -124,9 +124,9 @@ if __name__ == "__main__":
     if epoch > 0:
         model_path = os.path.join(exp_root, "models", f"model_{epoch:03d}.pt")
         model.load_state_dict(torch.load(model_path)['model'])
-    model.to('cpu')
+    model.to('cuda:0')
 
-    video = cv2.VideoCapture('video_test.mp4')
+    video = cv2.VideoCapture('MOVI1378.avi')
     fps = video.get(cv2.CAP_PROP_FPS)
     w = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
