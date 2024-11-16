@@ -1,5 +1,5 @@
 # Training settings
-exps_dir: 'experiments'
+exps_dir: '/content/drive/MyDrive/shufflenet_v2_x0_5_loss'
 iter_log_interval: 1
 iter_time_window: 100
 model_save_interval: 1
@@ -29,7 +29,7 @@ lr_scheduler:
   name: CosineAnnealingLR
   parameters:
     T_max: 385
-checkpoint_save_interval: 205  # Lưu checkpoint mỗi 5 epoch
+
 
 # Testing settings
 test_parameters:

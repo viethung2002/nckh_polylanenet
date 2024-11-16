@@ -10,6 +10,8 @@ from time import time
 import numpy as np
 import torch
 
+import wandb  # Thêm import wandb
+
 from test import test
 from lib.config import Config
 from utils.evaluator import Evaluator
@@ -25,37 +27,23 @@ def save_train_state(path, model, optimizer, lr_scheduler, epoch):
     torch.save(train_state, path)
     logging.info(f"Checkpoint saved at {path}")
 
-
-
-# Hàm load checkpoint để tiếp tục huấn luyện
 # Hàm load checkpoint để tiếp tục huấn luyện
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    # checkpoint = torch.load(checkpoint_path)  # Thay 'torch.load_state_dict' bằng 'torch.load'
-    # print(type(checkpoint))  # In ra kiểu dữ liệu của checkpoint
-    # print(checkpoint)  # In ra nội dung của checkpoint để kiểm tra cấu trúc
-
     # Kiểm tra cấu trúc checkpoint
     if isinstance(checkpoint, dict):
-        # load model với GPU
         model.load_state_dict(checkpoint['model'])
-        # lode model với CPU
-        # model.load_state_dict(torch.load(os.path.join(exp_root, "models", "model_{:03d}.pt".format(epoch)), map_location='cpu')['model']) 
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['lr_scheduler'])
         epoch = checkpoint['epoch']
     else:
-        raise ValueError(f"Checkpoint at {checkpoint_path} không có cấu trúc hợp lệ!")
+        raise ValueError(f"Checkpoint tại {checkpoint_path} không có cấu trúc hợp lệ!")
 
-    logging.info(f"Checkpoint loaded from {checkpoint_path}, starting from epoch {epoch}")
+    logging.info(f"Checkpoint loaded from {checkpoint_path}, starting từ epoch {epoch}")
     return model, optimizer, scheduler, epoch
 
-
-
-
-# Hàm huấn luyện model
 # Hàm huấn luyện model
 def train(model, train_loader, exp_dir, cfg, val_loader, train_state=None):
     optimizer = cfg.get_optimizer(model.parameters())
@@ -77,12 +65,15 @@ def train(model, train_loader, exp_dir, cfg, val_loader, train_state=None):
     ITER_LOG_INTERVAL = cfg['iter_log_interval']
     ITER_TIME_WINDOW = cfg['iter_time_window']
     MODEL_SAVE_INTERVAL = cfg['model_save_interval']
-    CHECKPOINT_SAVE_INTERVAL = cfg['checkpoint_save_interval']
+    # CHECKPOINT_SAVE_INTERVAL = cfg['checkpoint_save_interval']  # Đã loại bỏ
     t0 = time()
     total_iter = 0
     iter_times = []
     logging.info("Starting training.")
     
+    # Định nghĩa tên các chỉ số đánh giá dựa trên cấu trúc của results
+    metric_names = ['Accuracy', 'FP', 'FN', 'FPS']
+
     for epoch in range(starting_epoch, num_epochs + 1):
         epoch_t0 = time()
         logging.info(f"Beginning epoch {epoch}")
@@ -104,17 +95,22 @@ def train(model, train_loader, exp_dir, cfg, val_loader, train_state=None):
             optimizer.step()
 
             iter_times.append(time() - iter_t0)
-            if len(iter_times) > 100:
+            if len(iter_times) > ITER_TIME_WINDOW:
                 iter_times = iter_times[-ITER_TIME_WINDOW:]
             if (i + 1) % ITER_LOG_INTERVAL == 0:
                 loss_str = ', '.join(
-                    ['{}: {:.4f}'.format(loss_name, loss_dict_i[loss_name]) for loss_name in loss_dict_i])
+                    ['{}: {:.4f}'.format(loss_name, loss_dict_i[loss_name]) for loss_name in loss_dict_i]
+                )
                 logging.info(f"Epoch [{epoch}/{num_epochs}], Step [{i+1}/{total_step}], Loss: {accum_loss / (i+1):.4f} ({loss_str}), s/iter: {np.mean(iter_times):.4f}, lr: {optimizer.param_groups[0]['lr']:.1e}")
-
-            # Lưu checkpoint
-            if total_iter % CHECKPOINT_SAVE_INTERVAL == 0:
-                checkpoint_path = os.path.join(exp_dir, "models", f"checkpoint_{total_iter:07d}.pt")
-                save_train_state(checkpoint_path, model, optimizer, scheduler, epoch)
+                
+                # Ghi lại các metric huấn luyện lên wandb
+                wandb.log({
+                    'train_loss': accum_loss / (i+1),
+                    **{'train_' + k: v for k, v in loss_dict_i.items()},
+                    's_per_iter': np.mean(iter_times),
+                    'learning_rate': optimizer.param_groups[0]['lr'],
+                    'epoch': epoch,
+                }, step=total_iter)
 
         logging.info(f"Epoch time: {time() - epoch_t0:.4f}")
 
@@ -136,7 +132,29 @@ def train(model, train_loader, exp_dir, cfg, val_loader, train_state=None):
                 verbose=False,
             )
             _, results = evaluator.eval(label=None, only_metrics=True)
+            logging.info(f"Validation results: {results}")
             logging.info(f"Epoch [{epoch}/{num_epochs}], Val loss: {val_loss:.4f}")
+            
+            # Đảm bảo rằng số lượng metrics tương ứng
+            if len(results) != len(metric_names):
+                logging.warning(f"Số lượng metrics trả về ({len(results)}) không khớp với số lượng metric_names ({len(metric_names)}).")
+            
+            # Tạo một dict từ các metrics
+            val_metrics = {f'val_{result["name"]}': result['value'] for result in results if result["name"] in metric_names}
+            
+            # Ghi lại các chỉ số đánh giá lên wandb
+            wandb.log({
+                'val_loss': val_loss,
+                **val_metrics,
+                'epoch': epoch,
+            }, step=total_iter)
+
+            # Ghi log các chỉ số đánh giá
+            eval_metrics_str = ', '.join(
+                [f"{k}: {v:.4f}" for k, v in val_metrics.items()]
+            )
+            logging.info(f"Epoch [{epoch}/{num_epochs}], Val Metrics: {eval_metrics_str}")
+
             model.train()
 
         scheduler.step()
@@ -144,7 +162,6 @@ def train(model, train_loader, exp_dir, cfg, val_loader, train_state=None):
     logging.info(f"Training time: {time() - t0:.4f}")
 
     return model
-
 
 
 
@@ -160,7 +177,6 @@ def parse_args():
 
     return parser.parse_args()
 
-
 def get_code_state():
     state = "Git hash: {}".format(
         subprocess.run(['git', 'rev-parse', 'HEAD'], stdout=subprocess.PIPE).stdout.decode('utf-8'))
@@ -168,7 +184,6 @@ def get_code_state():
     state += subprocess.run(['git', 'diff'], stdout=subprocess.PIPE).stdout.decode('utf-8')
 
     return state
-
 
 def setup_exp_dir(exps_dir, exp_name, cfg_path):
     dirs = ["models"]
@@ -182,7 +197,6 @@ def setup_exp_dir(exps_dir, exp_name, cfg_path):
         file.write(get_code_state())
 
     return exp_root
-
 
 # Hàm lấy trạng thái huấn luyện từ checkpoint
 def get_exp_train_state(exp_root):
@@ -211,12 +225,8 @@ def get_exp_train_state(exp_root):
     
     return model, optimizer, scheduler, epoch
 
-
-
-
 def log_on_exception(exc_type, exc_value, exc_traceback):
     logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
-
 
 if __name__ == "__main__":
     args = parse_args()
@@ -247,6 +257,13 @@ if __name__ == "__main__":
     )
 
     sys.excepthook = log_on_exception
+
+    # Khởi tạo wandb
+    wandb.init(
+        project="Tên_dự_án_của_bạn",  # Thay bằng tên dự án của bạn trên wandb
+        name=args.exp_name,
+        config=cfg.__dict__ if hasattr(cfg, '__dict__') else cfg
+    )
 
     logging.info("Experiment name: {}".format(args.exp_name))
     logging.info("Config:\n" + str(cfg))
@@ -281,6 +298,9 @@ if __name__ == "__main__":
                                                  batch_size=batch_size,
                                                  shuffle=False,
                                                  num_workers=8)
+    else:
+        val_loader = None  # Thêm dòng này để đảm bảo val_loader được định nghĩa
+
     # Train regressor
     try:
         model = train(
@@ -293,11 +313,14 @@ if __name__ == "__main__":
         )
     except KeyboardInterrupt:
         logging.info("Training session terminated.")
+
     test_epoch = -1
     if cfg['backup'] is not None:
         subprocess.run(['rclone', 'copy', exp_root, '{}/{}'.format(cfg['backup'], args.exp_name)])
 
-    # Eval model after training
+    # Kết thúc phiên làm việc với wandb
+    wandb.finish()
+
     # Eval model after training
     test_dataset = cfg.get_dataset("test")
 
@@ -308,6 +331,7 @@ if __name__ == "__main__":
 
     evaluator = Evaluator(test_loader.dataset, exp_root)
 
+    # Thiết lập lại logging để ghi vào test_log.txt
     logging.basicConfig(
         format="[%(asctime)s] [%(levelname)s] %(message)s",
         level=logging.INFO,
@@ -328,4 +352,3 @@ if __name__ == "__main__":
     eval_str, _ = evaluator.eval(label='{}_{}'.format(os.path.basename(args.exp_name), test_epoch))
 
     logging.info(eval_str)  # In kết quả đánh giá ra log
-
