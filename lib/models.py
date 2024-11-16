@@ -143,6 +143,26 @@ class PolyRegression(nn.Module):
 
         return outputs, extra_outputs
 
+    def focal_loss(self, pred_confs, target_confs, alpha=0.25, gamma=2.0):
+        """
+        Focal Loss for binary classification.
+
+        :param pred_confs: Predicted confidences (sigmoid outputs).
+        :param target_confs: Target labels (0 or 1).
+        :param alpha: Balancing factor for the class imbalance (default=0.25).
+        :param gamma: Focusing parameter to reduce loss for easy examples (default=2.0).
+        :return: Focal loss value.
+        """
+        # Clip predictions to prevent log(0) errors
+        pred_confs = torch.clamp(pred_confs, min=1e-7, max=1 - 1e-7)
+
+        # Compute the focal loss
+        target_confs = target_confs.float()
+        cross_entropy_loss = -target_confs * torch.log(pred_confs) - (1 - target_confs) * torch.log(1 - pred_confs)
+        loss = alpha * ((1 - pred_confs) ** gamma) * cross_entropy_loss
+
+        return loss.mean()  # Average loss over the batch
+
     def loss(self,
              outputs,
              target,
@@ -153,7 +173,6 @@ class PolyRegression(nn.Module):
              poly_weight=300,
              threshold=15 / 720.):
         pred, extra_outputs = outputs
-        bce = nn.BCELoss()
         mse = nn.MSELoss()
         s = nn.Sigmoid()
         threshold = nn.Threshold(threshold**2, 0.)
@@ -164,8 +183,6 @@ class PolyRegression(nn.Module):
         target_lowers, pred_lowers = target[:, :, 1], pred[:, :, 1]
 
         if self.share_top_y:
-            # inexistent lanes have -1e-5 as lower
-            # i'm just setting it to a high value here so that the .min below works fine
             target_lowers[target_lowers < 0] = 1
             target_lowers[...] = target_lowers.min(dim=1, keepdim=True)[0]
             pred_lowers[...] = pred_lowers[:, 0].reshape(-1, 1).expand(pred.shape[0], pred.shape[1])
@@ -179,7 +196,7 @@ class PolyRegression(nn.Module):
         lower_loss = mse(target_lowers[valid_lanes_idx], pred_lowers[valid_lanes_idx])
         upper_loss = mse(target_uppers[valid_lanes_idx], pred_uppers[valid_lanes_idx])
 
-        # classification loss
+        # Classification loss (using Focal Loss instead of BCE Loss)
         if self.pred_category and self.extra_outputs > 0:
             ce = nn.CrossEntropyLoss()
             pred_categories = extra_outputs.reshape(target.shape[0] * target.shape[1], -1)
@@ -190,7 +207,7 @@ class PolyRegression(nn.Module):
         else:
             cls_loss = 0
 
-        # poly loss calc
+        # Poly loss calculation
         target_xs = target_points[valid_lanes_idx_flat, :target_points.shape[1] // 2]
         ys = target_points[valid_lanes_idx_flat, target_points.shape[1] // 2:].t()
         valid_xs = target_xs >= 0
@@ -198,19 +215,20 @@ class PolyRegression(nn.Module):
         pred_xs = pred_polys[:, 0] * ys**3 + pred_polys[:, 1] * ys**2 + pred_polys[:, 2] * ys + pred_polys[:, 3]
         pred_xs.t_()
         weights = (torch.sum(valid_xs, dtype=torch.float32) / torch.sum(valid_xs, dim=1, dtype=torch.float32))**0.5
-        pred_xs = (pred_xs.t_() *
-                   weights).t()  # without this, lanes with more points would have more weight on the cost function
+        pred_xs = (pred_xs.t_() * weights).t()
         target_xs = (target_xs.t_() * weights).t()
         poly_loss = mse(pred_xs[valid_xs], target_xs[valid_xs]) / valid_lanes_idx.sum()
         poly_loss = threshold(
             (pred_xs[valid_xs] - target_xs[valid_xs])**2).sum() / (valid_lanes_idx.sum() * valid_xs.sum())
 
-        # applying weights to partial losses
+        # Applying weights to partial losses
         poly_loss = poly_loss * poly_weight
         lower_loss = lower_loss * lower_weight
         upper_loss = upper_loss * upper_weight
         cls_loss = cls_loss * cls_weight
-        conf_loss = bce(pred_confs, target_confs) * conf_weight
+
+        # Focal loss for confidence prediction
+        conf_loss = self.focal_loss(pred_confs, target_confs) * conf_weight
 
         loss = conf_loss + lower_loss + upper_loss + poly_loss + cls_loss
 
