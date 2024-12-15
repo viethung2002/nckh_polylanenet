@@ -86,7 +86,7 @@ def draw_annotation(pred=None, img=None, cls_pred=None):
 
     return img
 
-def predict_on_image(model, image, test_parameters, save=False, device="cuda:0"):
+def predict_on_image(model, image, test_parameters, save=False, device=None):
     # image = cv2.resize(image, (640, 360))
     input_image = normalize_image_for_test(image).unsqueeze(0).to(device)
 
@@ -105,26 +105,26 @@ def predict_on_image(model, image, test_parameters, save=False, device="cuda:0")
 if __name__ == "__main__":
     cfg = Config('cfgs/tusimple.yaml')
 
-    exp_root = os.path.join(cfg['exps_dir'], os.path.basename(os.path.normpath('experiments/tusimple')))
+    exp_root = os.path.join(cfg['exps_dir'], os.path.basename(os.path.normpath('experiments')))
     os.makedirs(exp_root, exist_ok=True)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = cfg.get_model().to(device)
     test_parameters = cfg.get_test_parameters()
-    epoch = 2695
+    epoch = 281
     if epoch > 0:
         model_path = os.path.join(exp_root, "models", f"model_{epoch:03d}.pt")
-        model.load_state_dict(torch.load(model_path)['model'])
-    model.to('cuda:0')
+        model.load_state_dict(torch.load(model_path, map_location=device)['model'])
+    model.to(device)
 
     # Đọc ảnh thay vì video
-    img = cv2.imread('lane1.jpg')  # Đọc ảnh từ file
+    img = cv2.imread('0000.png')  # Đọc ảnh từ file
 
     # Resize ảnh nếu cần
     frame_resize = cv2.resize(img, (640, 360))
 
     # Dự đoán trên ảnh
-    image = predict_on_image(model, frame_resize, test_parameters, save=True)
+    image = predict_on_image(model, frame_resize, test_parameters, save=True, device=device)
 
     # Lưu kết quả ảnh dự đoán
     cv2.imwrite('prediction_image.png', image)  # Lưu ảnh kết quả dự đoán

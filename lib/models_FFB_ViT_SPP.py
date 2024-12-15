@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torchvision.models import resnet34, resnet50, resnet101
+from efficientnet_pytorch import EfficientNet
 from torchvision import models
-from torchvision.ops import FeaturePyramidNetwork
-from collections import OrderedDict
 
 
 class OutputLayer(nn.Module):
@@ -45,106 +44,129 @@ class FeatureFlipBlock(nn.Module):
     def forward(self, x):
         return torch.flip(x, [self.axis])
 
+class SpatialPyramidPooling(nn.Module):
+    def __init__(self, pool_sizes=[1, 2, 4]):
+        super(SpatialPyramidPooling, self).__init__()
+        self.pool_sizes = pool_sizes
 
-
+    def forward(self, x):
+        batch_size, channels, height, width = x.size()
+        features = []
+        for pool_size in self.pool_sizes:
+            kernel_size = (height // pool_size, width // pool_size)
+            stride = kernel_size
+            pooling = nn.AdaptiveAvgPool2d(kernel_size)
+            pooled = pooling(x)
+            features.append(pooled.view(batch_size, -1))
+        return torch.cat(features, dim=1)
 
 class PolyRegression(nn.Module):
     def __init__(self,
                  num_outputs,
                  backbone,
-                 pretrained=True,
+                 pretrained,
                  curriculum_steps=None,
                  extra_outputs=0,
                  share_top_y=True,
                  pred_category=False,
                  attention_heads=5,
+                 vit_embed_dim=255,
+                 vit_num_layers=4,
                  use_flip_block=True,
-                 flip_axis=1):
+                 flip_axis=3,
+                 spp_pool_sizes=[1, 2, 4]):  # Added SPP pool sizes
         super(PolyRegression, self).__init__()
+
+        # Check if attention_heads divides embed_dim
+        if vit_embed_dim % attention_heads != 0:
+            raise ValueError(f"embed_dim ({vit_embed_dim}) must be divisible by num_heads ({attention_heads})")
 
         self.use_flip_block = use_flip_block
         self.flip_axis = flip_axis
+
+        # Initialize the backbone
+        self.model = self._initialize_backbone(backbone, num_outputs, pretrained, extra_outputs)
+
+        # Backbone feature output size
+        self.backbone_out_features = self.model.last_channel if backbone == 'mobilenet_v2' else 1280
+
+        # SPP Layer
+        self.spp = SpatialPyramidPooling(pool_sizes=spp_pool_sizes)
+        
+        # Dynamically compute the SPP output size
+        self.spp_output_size = self._compute_spp_output_size(spp_pool_sizes, feature_map_size=(12, 20))  # Adjust as needed
+
+        # Add a projection layer to reduce SPP output size
+        self.spp_projection = nn.Linear(self.spp_output_size, vit_embed_dim)
+
+        # Output Layer
+        self.output_layer = OutputLayer(nn.Linear(vit_embed_dim, num_outputs), extra_outputs)
+
+        # Self-Attention Layer
+        self.attention = SelfAttention(embed_size=num_outputs, heads=attention_heads)
+
+        # Feature Flip Block (if needed)
+        if self.use_flip_block:
+            self.feature_flip = FeatureFlipBlock(axis=self.flip_axis)
+
+        # Other attributes
         self.curriculum_steps = curriculum_steps if curriculum_steps else [0, 0, 0, 0]
         self.share_top_y = share_top_y
         self.extra_outputs = extra_outputs
         self.pred_category = pred_category
         self.sigmoid = nn.Sigmoid()
 
-        # Initialize backbone
-        self.model = self._initialize_backbone(backbone, num_outputs, pretrained, extra_outputs)
-
-        # Adjust Feature Pyramid Network
-        in_channels_list = [16, 24, 32, 96]  # Corrected channels from mobilenet_v2
-        self.fpn = FeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=256)
-
-        # Output layers
-        self.fpn_output = nn.Conv2d(256, num_outputs, kernel_size=1)
-        self.extra_output_layer = (
-            nn.Conv2d(256, extra_outputs, kernel_size=1) if extra_outputs > 0 else None
-        )
-
-        # Self-Attention
-        self.attention = SelfAttention(embed_size=num_outputs, heads=attention_heads)
-
-        # Flip block
-        if self.use_flip_block:
-            self.flip_block = FeatureFlipBlock(axis=self.flip_axis)
-
     def _initialize_backbone(self, backbone, num_outputs, pretrained, extra_outputs):
-        if 'mobilenet_v2' in backbone:
+        """
+        Initialize the backbone network based on the provided backbone type.
+        """
+        if backbone == 'mobilenet_v2':
             model = models.mobilenet_v2(pretrained=pretrained)
-            return nn.ModuleList([
-                model.features[:2],   # Stage 0 (16 channels)
-                model.features[2:4],  # Stage 1 (24 channels)
-                model.features[4:7],  # Stage 2 (32 channels)
-                model.features[7:14], # Stage 3 (96 channels)
-            ])
+            self.backbone_out_features = model.last_channel  # MobileNetV2 default is 1280
+            model.classifier[1] = OutputLayer(nn.Linear(model.classifier[1].in_features, num_outputs), extra_outputs)
         else:
-            raise NotImplementedError(f"Backbone {backbone} not supported")
+            raise NotImplementedError(f"Backbone {backbone} not implemented")
 
-    def _extract_backbone_features(self, x):
-        """
-        Extract features from backbone for each stage. Ensure features match FPN stages.
-        """
-        features = OrderedDict()
-        for idx, layer in enumerate(self.model):
-            x = layer(x)
-            features[str(idx)] = x
-            # print(f"Stage {idx} output shape: {x.shape}")  # Debugging output shape
-        return features
+        return model
 
-    def forward(self, x, epoch=None, **kwargs):
+    def _compute_spp_output_size(self, pool_sizes, feature_map_size):
+        """
+        Dynamically compute the output size of the SPP layer based on pooling sizes and feature map dimensions.
+        """
+        h, w = feature_map_size
+        output_size = 0
+        for pool_size in pool_sizes:
+            kernel_h, kernel_w = h // pool_size, w // pool_size
+            output_size += self.backbone_out_features * kernel_h * kernel_w
+        return output_size
+
+    def forward(self, x, epoch=None):
+        print(f"Input shape: {x.shape}")  # Debug
+        features = self.model.features(x)  # Extract features from backbone
+        print(f"Shape after backbone: {features.shape}")  # Debug
+
         if self.use_flip_block:
-            x = self.flip_block(x)
+            features = self.feature_flip(features)
+            print(f"Shape after FeatureFlipBlock: {features.shape}")  # Debug
 
-        # Extract features from backbone
-        features = self._extract_backbone_features(x)
+        # Apply SPP
+        features = self.spp(features)
+        print(f"Shape after SPP: {features.shape}")  # Debug
 
-        # Apply FPN
-        fpn_features = self.fpn(features)
+        # Apply SPP projection
+        features = self.spp_projection(features)
+        print(f"Shape after SPP Projection: {features.shape}")  # Debug
 
-        # Use top FPN output for regression
-        fpn_output = self.fpn_output(fpn_features["3"])
-        fpn_output = F.adaptive_avg_pool2d(fpn_output, (1, 1)).view(fpn_output.size(0), -1)
+        # Linear Layer and Self-Attention
+        output, extra_outputs = self.output_layer(features)
+        output, _ = self.attention(output, output, output)
 
-        # Compute extra outputs if needed
-        extra_outputs = None
-        if self.extra_outputs > 0:
-            extra_outputs = self.extra_output_layer(fpn_features["3"])
-            extra_outputs = F.adaptive_avg_pool2d(extra_outputs, (1, 1)).view(extra_outputs.size(0), -1)
-
-        # Apply Self-Attention
-        fpn_output, _ = self.attention(fpn_output, fpn_output, fpn_output)
-
-        # Curriculum learning
+        # Curriculum Learning
         for i in range(len(self.curriculum_steps)):
             if epoch is not None and epoch < self.curriculum_steps[i]:
-                fpn_output[:, -len(self.curriculum_steps) + i] = 0
+                output[:, -len(self.curriculum_steps) + i] = 0
 
-        return fpn_output, extra_outputs
-
-
-
+        return output, extra_outputs
 
 
 
@@ -158,6 +180,7 @@ class PolyRegression(nn.Module):
         outputs[outputs[:, :, 0] < conf_threshold] = 0
 
         return outputs, extra_outputs
+
 
     def focal_loss(self, pred_confs, target_confs, alpha=0.25, gamma=2.0):
         """
@@ -255,4 +278,3 @@ class PolyRegression(nn.Module):
             'poly': poly_loss,
             'cls_loss': cls_loss
         }
- 

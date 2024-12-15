@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torchvision.models import resnet34, resnet50, resnet101
+from efficientnet_pytorch import EfficientNet
 from torchvision import models
-from torchvision.ops import FeaturePyramidNetwork
-from collections import OrderedDict
 
 
 class OutputLayer(nn.Module):
@@ -46,13 +45,11 @@ class FeatureFlipBlock(nn.Module):
         return torch.flip(x, [self.axis])
 
 
-
-
 class PolyRegression(nn.Module):
     def __init__(self,
                  num_outputs,
                  backbone,
-                 pretrained=True,
+                 pretrained,
                  curriculum_steps=None,
                  extra_outputs=0,
                  share_top_y=True,
@@ -62,91 +59,108 @@ class PolyRegression(nn.Module):
                  flip_axis=1):
         super(PolyRegression, self).__init__()
 
+        # Kiểm tra và điều chỉnh attention_heads sao cho num_outputs chia hết cho attention_heads
+        if num_outputs % attention_heads != 0:
+            raise ValueError(f"embed_size ({num_outputs}) must be divisible by num_heads ({attention_heads})")
+
         self.use_flip_block = use_flip_block
         self.flip_axis = flip_axis
+
+        # Khởi tạo mô hình backbone
+        self.model = self._initialize_backbone(backbone, num_outputs, pretrained, extra_outputs)
+
+        # Lớp Self-Attention
+        self.attention = SelfAttention(embed_size=num_outputs, heads=attention_heads)
+
+        # Khởi tạo Feature Flip Block nếu cần
+        if self.use_flip_block:
+            self.flip_block = FeatureFlipBlock(axis=self.flip_axis)
+
+        # Các tham số khác
         self.curriculum_steps = curriculum_steps if curriculum_steps else [0, 0, 0, 0]
         self.share_top_y = share_top_y
         self.extra_outputs = extra_outputs
         self.pred_category = pred_category
         self.sigmoid = nn.Sigmoid()
 
-        # Initialize backbone
-        self.model = self._initialize_backbone(backbone, num_outputs, pretrained, extra_outputs)
-
-        # Adjust Feature Pyramid Network
-        in_channels_list = [16, 24, 32, 96]  # Corrected channels from mobilenet_v2
-        self.fpn = FeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=256)
-
-        # Output layers
-        self.fpn_output = nn.Conv2d(256, num_outputs, kernel_size=1)
-        self.extra_output_layer = (
-            nn.Conv2d(256, extra_outputs, kernel_size=1) if extra_outputs > 0 else None
-        )
-
-        # Self-Attention
-        self.attention = SelfAttention(embed_size=num_outputs, heads=attention_heads)
-
-        # Flip block
-        if self.use_flip_block:
-            self.flip_block = FeatureFlipBlock(axis=self.flip_axis)
-
     def _initialize_backbone(self, backbone, num_outputs, pretrained, extra_outputs):
-        if 'mobilenet_v2' in backbone:
+        """
+        Initialize the backbone network based on the provided backbone type.
+        """
+        if 'efficientnet' in backbone:
+            if pretrained:
+                model = EfficientNet.from_pretrained(backbone, num_classes=num_outputs)
+            else:
+                model = EfficientNet.from_name(backbone, override_params={'num_classes': num_outputs})
+            model._fc = OutputLayer(model._fc, extra_outputs)
+        elif backbone == 'resnet34':
+            model = models.resnet34(pretrained=pretrained)
+            model.fc = nn.Linear(model.fc.in_features, num_outputs)
+            model.fc = OutputLayer(model.fc, extra_outputs)
+        elif backbone == 'resnet50':
+            model = models.resnet50(pretrained=pretrained)
+            model.fc = nn.Linear(model.fc.in_features, num_outputs)
+            model.fc = OutputLayer(model.fc, extra_outputs)
+        elif backbone == 'resnet101':
+            model = models.resnet101(pretrained=pretrained)
+            model.fc = nn.Linear(model.fc.in_features, num_outputs)
+            model.fc = OutputLayer(model.fc, extra_outputs)
+        elif backbone == 'mobilenet_v2':
             model = models.mobilenet_v2(pretrained=pretrained)
-            return nn.ModuleList([
-                model.features[:2],   # Stage 0 (16 channels)
-                model.features[2:4],  # Stage 1 (24 channels)
-                model.features[4:7],  # Stage 2 (32 channels)
-                model.features[7:14], # Stage 3 (96 channels)
-            ])
+            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_outputs)
+            model.classifier[1] = OutputLayer(model.classifier[1], extra_outputs)
+        elif backbone == 'mobilenet_v3_small':
+            model = models.mobilenet_v3_small(pretrained=pretrained)
+            model.classifier[3] = nn.Linear(model.classifier[3].in_features, num_outputs)
+            model.classifier[3] = OutputLayer(model.classifier[3], extra_outputs)
+        elif backbone == 'mobilenet_v3_large':
+            model = models.mobilenet_v3_large(pretrained=pretrained)
+            model.classifier[3] = nn.Linear(model.classifier[3].in_features, num_outputs)
+            model.classifier[3] = OutputLayer(model.classifier[3], extra_outputs)
+        elif backbone == 'squeezenet1_0':
+            model = models.squeezenet1_0(pretrained=pretrained)
+            model.classifier[1] = nn.Conv2d(512, num_outputs, kernel_size=(1, 1), stride=(1, 1))
+            model.classifier[1] = OutputLayer(model.classifier[1], extra_outputs)
+        elif backbone == 'squeezenet1_1':
+            model = models.squeezenet1_1(pretrained=pretrained)
+            model.classifier[1] = nn.Conv2d(512, num_outputs, kernel_size=(1, 1), stride=(1, 1))
+            model.classifier[1] = OutputLayer(model.classifier[1], extra_outputs)
+        elif backbone == 'shufflenet_v2_x0_5':
+            model = models.shufflenet_v2_x0_5(pretrained=pretrained)
+            model.fc = nn.Linear(model.fc.in_features, num_outputs)
+            model.fc = OutputLayer(model.fc, extra_outputs)
+        elif backbone == 'shufflenet_v2_x1_0':
+            model = models.shufflenet_v2_x1_0(pretrained=pretrained)
+            model.fc = nn.Linear(model.fc.in_features, num_outputs)
+            model.fc = OutputLayer(model.fc, extra_outputs)
+        elif backbone == 'shufflenet_v2_x1_5':
+            model = models.shufflenet_v2_x1_5(pretrained=pretrained)
+            model.fc = nn.Linear(model.fc.in_features, num_outputs)
+            model.fc = OutputLayer(model.fc, extra_outputs)
+        elif backbone == 'shufflenet_v2_x2_0':
+            model = models.shufflenet_v2_x2_0(pretrained=pretrained)
+            model.fc = nn.Linear(model.fc.in_features, num_outputs)
+            model.fc = OutputLayer(model.fc, extra_outputs)
         else:
-            raise NotImplementedError(f"Backbone {backbone} not supported")
-
-    def _extract_backbone_features(self, x):
-        """
-        Extract features from backbone for each stage. Ensure features match FPN stages.
-        """
-        features = OrderedDict()
-        for idx, layer in enumerate(self.model):
-            x = layer(x)
-            features[str(idx)] = x
-            # print(f"Stage {idx} output shape: {x.shape}")  # Debugging output shape
-        return features
+            raise NotImplementedError(f"Backbone {backbone} not implemented")
+        
+        return model
 
     def forward(self, x, epoch=None, **kwargs):
         if self.use_flip_block:
-            x = self.flip_block(x)
+            x = self.flip_block(x)  # Lật dữ liệu nếu cần
 
-        # Extract features from backbone
-        features = self._extract_backbone_features(x)
+        output, extra_outputs = self.model(x, **kwargs)
 
-        # Apply FPN
-        fpn_features = self.fpn(features)
+        # Áp dụng Self-Attention
+        output, _ = self.attention(output, output, output)
 
-        # Use top FPN output for regression
-        fpn_output = self.fpn_output(fpn_features["3"])
-        fpn_output = F.adaptive_avg_pool2d(fpn_output, (1, 1)).view(fpn_output.size(0), -1)
-
-        # Compute extra outputs if needed
-        extra_outputs = None
-        if self.extra_outputs > 0:
-            extra_outputs = self.extra_output_layer(fpn_features["3"])
-            extra_outputs = F.adaptive_avg_pool2d(extra_outputs, (1, 1)).view(extra_outputs.size(0), -1)
-
-        # Apply Self-Attention
-        fpn_output, _ = self.attention(fpn_output, fpn_output, fpn_output)
-
-        # Curriculum learning
+        # Áp dụng học theo chương trình (curriculum learning)
         for i in range(len(self.curriculum_steps)):
             if epoch is not None and epoch < self.curriculum_steps[i]:
-                fpn_output[:, -len(self.curriculum_steps) + i] = 0
+                output[:, -len(self.curriculum_steps) + i] = 0
 
-        return fpn_output, extra_outputs
-
-
-
-
-
+        return output, extra_outputs
 
     def decode(self, all_outputs, labels, conf_threshold=0.5):
         outputs, extra_outputs = all_outputs
@@ -255,4 +269,3 @@ class PolyRegression(nn.Module):
             'poly': poly_loss,
             'cls_loss': cls_loss
         }
- 

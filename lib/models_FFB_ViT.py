@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import models
-from torchvision.ops import FeaturePyramidNetwork
-from collections import OrderedDict
+from torchvision.models import mobilenet_v2
+from efficientnet_pytorch import EfficientNet
 
 
 class OutputLayer(nn.Module):
@@ -16,10 +14,7 @@ class OutputLayer(nn.Module):
 
     def forward(self, x):
         regular_outputs = self.regular_outputs_layer(x)
-        if self.num_extra > 0:
-            extra_outputs = self.extra_outputs_layer(x)
-        else:
-            extra_outputs = None
+        extra_outputs = self.extra_outputs_layer(x) if self.num_extra > 0 else None
         return regular_outputs, extra_outputs
 
 
@@ -38,112 +33,125 @@ class SelfAttention(nn.Module):
 
 
 class FeatureFlipBlock(nn.Module):
-    def __init__(self, axis=1):
+    def __init__(self, axis=3):  # Flip along width by default
         super(FeatureFlipBlock, self).__init__()
         self.axis = axis
 
     def forward(self, x):
-        return torch.flip(x, [self.axis])
+        if x.dim() < self.axis + 1:
+            raise ValueError(f"Input tensor does not have enough dimensions for flipping along axis {self.axis}")
+        return torch.cat([x, torch.flip(x, dims=[self.axis])], dim=1)  # Concatenate original and flipped features
 
 
+class ViTEncoder(nn.Module):
+    def __init__(self, input_dim, embed_dim, num_heads, num_layers):
+        super(ViTEncoder, self).__init__()
+
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+
+        self.embedding = nn.Linear(input_dim, embed_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        if len(x.size()) == 4:  # [Batch, Channels, Height, Width]
+            batch_size, channels, height, width = x.size()
+            x = x.view(batch_size, channels, -1).transpose(1, 2)  # [Batch, HW, Channels]
+        elif len(x.size()) != 3:  # Must be [Batch, HW, Channels] if not 4D
+            raise ValueError(f"Unexpected input shape {x.size()}, expected 3D or 4D tensor.")
+
+        x = self.embedding(x)  # [Batch, HW, embed_dim]
+        x = self.encoder(x)  # [Batch, HW, embed_dim]
+        x = self.norm(x.mean(dim=1))  # Global Average Pooling
+        return x
 
 
 class PolyRegression(nn.Module):
     def __init__(self,
                  num_outputs,
                  backbone,
-                 pretrained=True,
+                 pretrained,
                  curriculum_steps=None,
                  extra_outputs=0,
                  share_top_y=True,
                  pred_category=False,
                  attention_heads=5,
+                 vit_embed_dim=255,
+                 vit_num_layers=4,
                  use_flip_block=True,
-                 flip_axis=1):
+                 flip_axis=3):
         super(PolyRegression, self).__init__()
+
+        # Check if attention_heads divides embed_dim
+        if vit_embed_dim % attention_heads != 0:
+            raise ValueError(f"embed_dim ({vit_embed_dim}) must be divisible by num_heads ({attention_heads})")
 
         self.use_flip_block = use_flip_block
         self.flip_axis = flip_axis
-        self.curriculum_steps = curriculum_steps if curriculum_steps else [0, 0, 0, 0]
+
+        # Backbone
+        self.model = self._initialize_backbone(backbone, pretrained)
+        self.backbone_out_features = 1280  # Output from MobileNetV2
+        if self.use_flip_block:
+            self.feature_flip = FeatureFlipBlock(axis=self.flip_axis)
+            self.backbone_out_features *= 2  # Double the output channels after flipping
+
+        # Vision Transformer Encoder
+        self.vit_encoder = ViTEncoder(
+            input_dim=self.backbone_out_features,
+            embed_dim=vit_embed_dim,
+            num_heads=attention_heads,
+            num_layers=vit_num_layers
+        )
+
+        # Output Layer
+        self.output_layer = OutputLayer(nn.Linear(vit_embed_dim, num_outputs), extra_outputs)
+
+        # Self-Attention
+        self.attention = SelfAttention(embed_size=num_outputs, heads=attention_heads)
+
+        # Additional Parameters
+        self.curriculum_steps = [0, 0, 0, 0] if curriculum_steps is None else curriculum_steps
         self.share_top_y = share_top_y
         self.extra_outputs = extra_outputs
         self.pred_category = pred_category
         self.sigmoid = nn.Sigmoid()
 
-        # Initialize backbone
-        self.model = self._initialize_backbone(backbone, num_outputs, pretrained, extra_outputs)
-
-        # Adjust Feature Pyramid Network
-        in_channels_list = [16, 24, 32, 96]  # Corrected channels from mobilenet_v2
-        self.fpn = FeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=256)
-
-        # Output layers
-        self.fpn_output = nn.Conv2d(256, num_outputs, kernel_size=1)
-        self.extra_output_layer = (
-            nn.Conv2d(256, extra_outputs, kernel_size=1) if extra_outputs > 0 else None
-        )
-
-        # Self-Attention
-        self.attention = SelfAttention(embed_size=num_outputs, heads=attention_heads)
-
-        # Flip block
-        if self.use_flip_block:
-            self.flip_block = FeatureFlipBlock(axis=self.flip_axis)
-
-    def _initialize_backbone(self, backbone, num_outputs, pretrained, extra_outputs):
-        if 'mobilenet_v2' in backbone:
-            model = models.mobilenet_v2(pretrained=pretrained)
-            return nn.ModuleList([
-                model.features[:2],   # Stage 0 (16 channels)
-                model.features[2:4],  # Stage 1 (24 channels)
-                model.features[4:7],  # Stage 2 (32 channels)
-                model.features[7:14], # Stage 3 (96 channels)
-            ])
+    def _initialize_backbone(self, backbone, pretrained):
+        if backbone == 'mobilenet_v2':
+            model = mobilenet_v2(pretrained=pretrained)
+            model.classifier = nn.Identity()
         else:
-            raise NotImplementedError(f"Backbone {backbone} not supported")
+            raise NotImplementedError(f"Backbone {backbone} not implemented")
+        return model
 
-    def _extract_backbone_features(self, x):
-        """
-        Extract features from backbone for each stage. Ensure features match FPN stages.
-        """
-        features = OrderedDict()
-        for idx, layer in enumerate(self.model):
-            x = layer(x)
-            features[str(idx)] = x
-            # print(f"Stage {idx} output shape: {x.shape}")  # Debugging output shape
-        return features
+    def forward(self, x, epoch=None):
+        # print(f"Input shape: {x.shape}")  # Debug
+        features = self.model.features(x)  # Extract features from backbone
+        # print(f"Shape after backbone: {features.shape}")  # Debug
 
-    def forward(self, x, epoch=None, **kwargs):
         if self.use_flip_block:
-            x = self.flip_block(x)
+            features = self.feature_flip(features)
+            # print(f"Shape after FeatureFlipBlock: {features.shape}")  # Debug
 
-        # Extract features from backbone
-        features = self._extract_backbone_features(x)
+        encoded_features = self.vit_encoder(features)
+        # print(f"Shape after ViT Encoder: {encoded_features.shape}")  # Debug
 
-        # Apply FPN
-        fpn_features = self.fpn(features)
+        output, extra_outputs = self.output_layer(encoded_features)
+        output, _ = self.attention(output, output, output)
 
-        # Use top FPN output for regression
-        fpn_output = self.fpn_output(fpn_features["3"])
-        fpn_output = F.adaptive_avg_pool2d(fpn_output, (1, 1)).view(fpn_output.size(0), -1)
-
-        # Compute extra outputs if needed
-        extra_outputs = None
-        if self.extra_outputs > 0:
-            extra_outputs = self.extra_output_layer(fpn_features["3"])
-            extra_outputs = F.adaptive_avg_pool2d(extra_outputs, (1, 1)).view(extra_outputs.size(0), -1)
-
-        # Apply Self-Attention
-        fpn_output, _ = self.attention(fpn_output, fpn_output, fpn_output)
-
-        # Curriculum learning
+        # Curriculum Learning
         for i in range(len(self.curriculum_steps)):
             if epoch is not None and epoch < self.curriculum_steps[i]:
-                fpn_output[:, -len(self.curriculum_steps) + i] = 0
+                output[:, -len(self.curriculum_steps) + i] = 0
 
-        return fpn_output, extra_outputs
-
-
+        return output, extra_outputs
 
 
 
@@ -255,4 +263,3 @@ class PolyRegression(nn.Module):
             'poly': poly_loss,
             'cls_loss': cls_loss
         }
- 

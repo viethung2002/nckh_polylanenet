@@ -46,6 +46,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
 
 # Hàm huấn luyện model
 def train(model, train_loader, exp_dir, cfg, val_loader, train_state=None):
+    logging.info(f"Model structure: {model}")
     optimizer = cfg.get_optimizer(model.parameters())
     scheduler = cfg.get_lr_scheduler(optimizer)
     starting_epoch = 1
