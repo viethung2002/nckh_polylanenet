@@ -240,7 +240,7 @@ class PolyRegression(nn.Module):
             upper_weight=1,
             cls_weight=1,
             poly_weight=300,
-            line_iou_weight=300,  # New weight for Line IoU Loss
+            line_iou_weight=0.5,  # New weight for Line IoU Loss
             threshold=15 / 720.):
         pred, extra_outputs = outputs
         mse = nn.MSELoss()

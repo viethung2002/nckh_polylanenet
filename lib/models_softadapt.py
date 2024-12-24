@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from lib.papfn import PathAggregationFeaturePyramidNetwork
 
+from softadapt import SoftAdapt
 
 class OutputLayer(nn.Module):
     def __init__(self, fc, num_extra):
@@ -112,6 +113,16 @@ class PolyRegression(nn.Module):
 
         # Channel adapter to match the backbone input channels
         self.channel_adapter = nn.Conv2d(256, 3, kernel_size=1)
+
+        # Initialize SoftAdapt for dynamic loss weighting
+        self.softadapt = SoftAdapt(beta=0.1, accuracy_order=2)
+        self.loss_history = {
+            "conf": deque(maxlen=3),
+            "lower": deque(maxlen=3),
+            "upper": deque(maxlen=3),
+            "poly": deque(maxlen=3),
+            "line_iou": deque(maxlen=3)
+        }
 
     def _initialize_backbone(self, backbone, num_outputs, pretrained, extra_outputs):
         if 'mobilenet_v2' in backbone:
@@ -232,21 +243,14 @@ class PolyRegression(nn.Module):
 
         return loss.mean()  # Average loss over the batch
 
-    def loss(self,
-            outputs,
-            target,
-            conf_weight=1,
-            lower_weight=1,
-            upper_weight=1,
-            cls_weight=1,
-            poly_weight=300,
-            line_iou_weight=300,  # New weight for Line IoU Loss
-            threshold=15 / 720.):
+    def compute_individual_losses(self, outputs, target):
+        """
+        Compute the individual losses for each loss component.
+        """
         pred, extra_outputs = outputs
         mse = nn.MSELoss()
         bce = nn.BCELoss()
         s = nn.Sigmoid()
-        threshold = nn.Threshold(threshold**2, 0.)
         pred = pred.reshape(-1, target.shape[1], 1 + 2 + 4)
         target_categories, pred_confs = target[:, :, 0].reshape((-1, 1)), s(pred[:, :, 0]).reshape((-1, 1))
         target_uppers, pred_uppers = target[:, :, 2].reshape((-1, 1)), pred[:, :, 2].reshape((-1, 1))
@@ -264,21 +268,11 @@ class PolyRegression(nn.Module):
         target_confs = (target_categories > 0).float()
         valid_lanes_idx = target_confs == 1
         valid_lanes_idx_flat = valid_lanes_idx.reshape(-1)
+
+        conf_loss = bce(pred_confs, target_confs)
         lower_loss = mse(target_lowers[valid_lanes_idx], pred_lowers[valid_lanes_idx])
         upper_loss = mse(target_uppers[valid_lanes_idx], pred_uppers[valid_lanes_idx])
 
-        # Classification loss (using Focal Loss instead of BCE Loss)
-        if self.pred_category and self.extra_outputs > 0:
-            ce = nn.CrossEntropyLoss()
-            pred_categories = extra_outputs.reshape(target.shape[0] * target.shape[1], -1)
-            target_categories = target_categories.reshape(pred_categories.shape[:-1]).long()
-            pred_categories = pred_categories[target_categories > 0]
-            target_categories = target_categories[target_categories > 0]
-            cls_loss = ce(pred_categories, target_categories - 1)
-        else:
-            cls_loss = 0
-
-        # Poly loss calculation
         target_xs = target_points[valid_lanes_idx_flat, :target_points.shape[1] // 2]
         ys = target_points[valid_lanes_idx_flat, target_points.shape[1] // 2:].t()
         valid_xs = target_xs >= 0
@@ -289,32 +283,34 @@ class PolyRegression(nn.Module):
         pred_xs = (pred_xs.t_() * weights).t()
         target_xs = (target_xs.t_() * weights).t()
         poly_loss = mse(pred_xs[valid_xs], target_xs[valid_xs]) / valid_lanes_idx.sum()
-        poly_loss = threshold(
-            (pred_xs[valid_xs] - target_xs[valid_xs])**2).sum() / (valid_lanes_idx.sum() * valid_xs.sum())
 
-        # Line IoU Loss calculation
-        pred_points = pred_xs.T  # Reshape to (N, points)
-        target_points = target_xs.T  # Reshape to (N, points)
+        pred_points = pred_xs.T
+        target_points = target_xs.T
         line_iou_loss = self.line_iou_loss(pred_points, target_points)
 
-        # Applying weights to partial losses
-        poly_loss = poly_loss * poly_weight
-        lower_loss = lower_loss * lower_weight
-        upper_loss = upper_loss * upper_weight
-        cls_loss = cls_loss * cls_weight
-        line_iou_loss = line_iou_loss * line_iou_weight
+        return [conf_loss, lower_loss, upper_loss, poly_loss, line_iou_loss]
 
-        # Focal loss for confidence prediction
-        # conf_loss = self.focal_loss(pred_confs, target_confs) * conf_weight
-        conf_loss = bce(pred_confs, target_confs) * conf_weight
+    def compute_total_loss(self, outputs, target):
+        """
+        Compute the total weighted loss using SoftAdapt.
+        """
+        individual_losses = self.compute_individual_losses(outputs, target)
 
-        loss = conf_loss + lower_loss + upper_loss + poly_loss + cls_loss + line_iou_loss
+        for key, loss in zip(self.loss_history.keys(), individual_losses):
+            self.loss_history[key].append(loss.detach().item())
 
-        return loss, {
-            'conf': conf_loss,
-            'lower': lower_loss,
-            'upper': upper_loss,
-            'poly': poly_loss,
-            'cls_loss': cls_loss,
-            'line_iou': line_iou_loss
-        }
+        # Only proceed if all have sufficient history
+        if any(len(self.loss_history[key]) < 3 for key in self.loss_history.keys()):
+            # Use default weights
+            weights = torch.ones(len(self.loss_history))
+            total_loss = sum(individual_losses)
+        else:
+            # Convert history to tensors
+            detached_losses = [
+                torch.tensor(self.loss_history[key], device=individual_losses[0].device)
+                for key in self.loss_history.keys()
+            ]
+            weights = self.softadapt.get_component_weights(*detached_losses)
+            total_loss = sum(w * l for w, l in zip(weights, individual_losses))
+
+        return total_loss, weights

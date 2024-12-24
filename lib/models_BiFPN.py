@@ -3,25 +3,37 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 from collections import OrderedDict
-from lib.papfn import PathAggregationFeaturePyramidNetwork
 
-
-class OutputLayer(nn.Module):
-    def __init__(self, fc, num_extra):
-        super(OutputLayer, self).__init__()
-        self.regular_outputs_layer = fc
-        self.num_extra = num_extra
-        if num_extra > 0:
-            self.extra_outputs_layer = nn.Linear(fc.in_features, num_extra)
+class BiFPNBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(BiFPNBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.norm = nn.BatchNorm2d(out_channels)
 
     def forward(self, x):
-        regular_outputs = self.regular_outputs_layer(x)
-        if self.num_extra > 0:
-            extra_outputs = self.extra_outputs_layer(x)
-        else:
-            extra_outputs = None
-        return regular_outputs, extra_outputs
+        x = self.relu(self.norm(self.conv1(x)))
+        x = self.relu(self.norm(self.conv2(x)))
+        return x
 
+class BiFPN(nn.Module):
+    def __init__(self, in_channels_list, out_channels):
+        super(BiFPN, self).__init__()
+        self.bifpn_blocks = nn.ModuleList([
+            BiFPNBlock(in_channels, out_channels) for in_channels in in_channels_list
+        ])
+        self.out_channels = out_channels
+
+    def forward(self, features):
+        processed_features = [bifpn_block(feature) for bifpn_block, feature in zip(self.bifpn_blocks, features)]
+        
+        # Ensure all feature maps have the same size before summing them
+        target_size = processed_features[0].size()[2:]
+        processed_features = [F.interpolate(feature, size=target_size, mode='nearest') for feature in processed_features]
+        print([f.shape for f in processed_features])
+        out = sum(processed_features)
+        return out
 
 class SelfAttention(nn.Module):
     def __init__(self, embed_size, heads):
@@ -36,37 +48,13 @@ class SelfAttention(nn.Module):
         output = self.norm(attention_output + query)  # Add residual connection
         return output, attention_weights
 
-
 class FeatureFlipBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, axis=1, kernel_size=3):
+    def __init__(self, axis=1):
         super(FeatureFlipBlock, self).__init__()
         self.axis = axis
 
-        # Tích chập để giảm chiều kênh từ 2C về C sau khi pooling
-        self.conv = nn.Conv2d(in_channels * 2, out_channels, kernel_size=kernel_size, padding=kernel_size // 2)
-
-        # Pooling trung bình để giảm chiều rộng (W -> W/2)
-        self.avg_pool = nn.AvgPool2d(kernel_size=(1, 2))  # Giảm chiều rộng còn một nửa
-
     def forward(self, x):
-        # print(f"Input to FeatureFlipBlock: {x.shape}")  # Debugging input shape
-        # Lật đặc trưng theo chiều axis
-        flipped = torch.flip(x, [self.axis])
-
-        # Kết hợp đặc trưng gốc và lật theo chiều kênh (2C)
-        merged = torch.cat([x, flipped], dim=1)
-        # print(f"After concatenation: {merged.shape}")  # Debugging shape after concatenation
-
-        # Pooling để giảm chiều rộng
-        pooled = self.avg_pool(merged)
-        # print(f"After average pooling: {pooled.shape}")  # Debugging shape after pooling
-
-        # Tích chập để giảm chiều kênh về out_channels
-        output = self.conv(pooled)
-        # print(f"Output of FeatureFlipBlock: {output.shape}")  # Debugging output shape
-
-        return output
-
+        return torch.flip(x, [self.axis])
 
 class PolyRegression(nn.Module):
     def __init__(self,
@@ -93,12 +81,12 @@ class PolyRegression(nn.Module):
         # Initialize backbone
         self.model = self._initialize_backbone(backbone, num_outputs, pretrained, extra_outputs)
 
-        # Adjust Path Aggregation Pyramid Network (PAPFN)
-        in_channels_list = [16, 24, 32, 96]  # Các kênh tương ứng với các stage của backbone
-        self.papfn = PathAggregationFeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=256)
+        # Adjust BiFPN
+        in_channels_list = [16, 24, 32, 96]  # Channels from mobilenet_v2
+        self.bifpn = BiFPN(in_channels_list=in_channels_list, out_channels=256)
 
         # Output layers
-        self.papfn_output = nn.Conv2d(256, num_outputs, kernel_size=1)
+        self.bifpn_output = nn.Conv2d(256, num_outputs, kernel_size=1)
         self.extra_output_layer = (
             nn.Conv2d(256, extra_outputs, kernel_size=1) if extra_outputs > 0 else None
         )
@@ -108,14 +96,17 @@ class PolyRegression(nn.Module):
 
         # Flip block
         if self.use_flip_block:
-            self.flip_block = FeatureFlipBlock(in_channels=3, out_channels=256, axis=self.flip_axis)  # Match the expected input channels of the backbone
+            self.flip_block = FeatureFlipBlock(axis=self.flip_axis)
 
-        # Channel adapter to match the backbone input channels
-        self.channel_adapter = nn.Conv2d(256, 3, kernel_size=1)
+        # Hook to store feature maps
+        self.feature_maps = {}
+        self._register_hooks()
 
     def _initialize_backbone(self, backbone, num_outputs, pretrained, extra_outputs):
         if 'mobilenet_v2' in backbone:
-            model = models.mobilenet_v2(pretrained=pretrained)
+            from torchvision.models import MobileNet_V2_Weights
+            weights = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
+            model = models.mobilenet_v2(weights=weights)
             return nn.ModuleList([
                 model.features[:2],   # Stage 0 (16 channels)
                 model.features[2:4],  # Stage 1 (24 channels)
@@ -127,47 +118,68 @@ class PolyRegression(nn.Module):
 
     def _extract_backbone_features(self, x):
         """
-        Extract features from backbone for each stage. Ensure features match FPN stages.
+        Extract features from backbone for each stage. Ensure features match BiFPN stages.
         """
         features = OrderedDict()
         for idx, layer in enumerate(self.model):
             x = layer(x)
-            # print(f"Backbone stage {idx} output shape: {x.shape}")  # Debugging output shape
             features[str(idx)] = x
         return features
 
+    def _register_hooks(self):
+        """
+        Register hooks to extract feature maps.
+        """
+        def hook_fn(module, input, output, key):
+            self.feature_maps[key] = output
+
+        for idx, layer in enumerate(self.model):
+            layer.register_forward_hook(lambda module, input, output, idx=idx: hook_fn(module, input, output, str(idx)))
+
     def forward(self, x, epoch=None, **kwargs):
-        
         if self.use_flip_block:
             x = self.flip_block(x)
-            x = self.channel_adapter(x)  # Adjust channels to match backbone input
-            # print(f"After channel adapter: {x.shape}")  # Debugging shape after channel adapter
 
         # Extract features from backbone
         features = self._extract_backbone_features(x)
+        self.feature_maps_backbone = features
 
-        # Apply PAPFN
-        papfn_features = self.papfn(features)
+        # Apply BiFPN
+        bifpn_features = self.bifpn(list(features.values()))
+        self.feature_maps_fpn = bifpn_features
 
-        # Use top PAPFN output for regression
-        papfn_output = self.papfn_output(papfn_features["3"])
-        papfn_output = F.adaptive_avg_pool2d(papfn_output, (1, 1)).view(papfn_output.size(0), -1)
+        # Use top BiFPN output for regression
+        bifpn_output = self.bifpn_output(bifpn_features)
+        bifpn_output = F.adaptive_avg_pool2d(bifpn_output, (1, 1)).view(bifpn_output.size(0), -1)
 
         # Compute extra outputs if needed
         extra_outputs = None
         if self.extra_outputs > 0:
-            extra_outputs = self.extra_output_layer(papfn_features["3"])
+            extra_outputs = self.extra_output_layer(bifpn_features)
             extra_outputs = F.adaptive_avg_pool2d(extra_outputs, (1, 1)).view(extra_outputs.size(0), -1)
 
         # Apply Self-Attention
-        papfn_output, _ = self.attention(papfn_output, papfn_output, papfn_output)
+        bifpn_output, attention_weights = self.attention(bifpn_output, bifpn_output, bifpn_output)
+
+        # Save the attention weights for later visualization
+        self.attention_maps = attention_weights.detach().cpu()
 
         # Curriculum learning
         for i in range(len(self.curriculum_steps)):
             if epoch is not None and epoch < self.curriculum_steps[i]:
-                papfn_output[:, -len(self.curriculum_steps) + i] = 0
+                bifpn_output[:, -len(self.curriculum_steps) + i] = 0
 
-        return papfn_output, extra_outputs
+        return bifpn_output, extra_outputs
+
+    def get_feature_maps(self):
+        """
+        Return the stored feature maps from Backbone and BiFPN.
+        """
+        return {
+            'backbone': self.feature_maps_backbone,
+            'bifpn': self.feature_maps_fpn,
+            'attention': self.attention_maps
+        }
 
     def decode(self, all_outputs, labels, conf_threshold=0.5):
         outputs, extra_outputs = all_outputs
@@ -179,40 +191,8 @@ class PolyRegression(nn.Module):
         outputs[outputs[:, :, 0] < conf_threshold] = 0
 
         return outputs, extra_outputs
-    def line_iou_loss(self, pred_points, target_points, radius=0.1):
-        """
-        Calculate Line IoU Loss.
-        
-        :param pred_points: Predicted lane points (N x 2 or N x 1 for x coordinates)
-        :param target_points: Ground truth lane points (N x 2 or N x 1 for x coordinates)
-        :param radius: Radius for extending points into line segments.
-        :return: Line IoU Loss (1 - Line IoU)
-        """
-        # Ensure inputs are in the same shape
-        assert pred_points.shape == target_points.shape, "Shape mismatch between predictions and targets"
 
-        # Extend points into line segments
-        pred_start = pred_points - radius
-        pred_end = pred_points + radius
-        target_start = target_points - radius
-        target_end = target_points + radius
-
-        # Calculate intersection and union
-        intersection_start = torch.max(pred_start, target_start)
-        intersection_end = torch.min(pred_end, target_end)
-        intersection = torch.clamp(intersection_end - intersection_start, min=0)
-
-        union_start = torch.min(pred_start, target_start)
-        union_end = torch.max(pred_end, target_end)
-        union = torch.clamp(union_end - union_start, min=0)
-
-        iou = intersection / (union + 1e-7)  # Add epsilon to prevent division by zero
-        line_iou = iou.sum(dim=1) / pred_points.shape[1]  # Average IoU over all points
-
-        # Line IoU Loss
-        liou_loss = 1 - line_iou.mean()
-        return liou_loss
-    def focal_loss(self, pred_confs, target_confs, alpha=0.2, gamma=2.0):
+    def focal_loss(self, pred_confs, target_confs, alpha=0.25, gamma=2.0):
         """
         Focal Loss for binary classification.
 
@@ -233,18 +213,16 @@ class PolyRegression(nn.Module):
         return loss.mean()  # Average loss over the batch
 
     def loss(self,
-            outputs,
-            target,
-            conf_weight=1,
-            lower_weight=1,
-            upper_weight=1,
-            cls_weight=1,
-            poly_weight=300,
-            line_iou_weight=300,  # New weight for Line IoU Loss
-            threshold=15 / 720.):
+             outputs,
+             target,
+             conf_weight=1,
+             lower_weight=1,
+             upper_weight=1,
+             cls_weight=1,
+             poly_weight=300,
+             threshold=15 / 720.):
         pred, extra_outputs = outputs
         mse = nn.MSELoss()
-        bce = nn.BCELoss()
         s = nn.Sigmoid()
         threshold = nn.Threshold(threshold**2, 0.)
         pred = pred.reshape(-1, target.shape[1], 1 + 2 + 4)
@@ -292,29 +270,21 @@ class PolyRegression(nn.Module):
         poly_loss = threshold(
             (pred_xs[valid_xs] - target_xs[valid_xs])**2).sum() / (valid_lanes_idx.sum() * valid_xs.sum())
 
-        # Line IoU Loss calculation
-        pred_points = pred_xs.T  # Reshape to (N, points)
-        target_points = target_xs.T  # Reshape to (N, points)
-        line_iou_loss = self.line_iou_loss(pred_points, target_points)
-
         # Applying weights to partial losses
         poly_loss = poly_loss * poly_weight
         lower_loss = lower_loss * lower_weight
         upper_loss = upper_loss * upper_weight
         cls_loss = cls_loss * cls_weight
-        line_iou_loss = line_iou_loss * line_iou_weight
 
         # Focal loss for confidence prediction
-        # conf_loss = self.focal_loss(pred_confs, target_confs) * conf_weight
-        conf_loss = bce(pred_confs, target_confs) * conf_weight
+        conf_loss = self.focal_loss(pred_confs, target_confs) * conf_weight
 
-        loss = conf_loss + lower_loss + upper_loss + poly_loss + cls_loss + line_iou_loss
+        loss = conf_loss + lower_loss + upper_loss + poly_loss + cls_loss
 
         return loss, {
             'conf': conf_loss,
             'lower': lower_loss,
             'upper': upper_loss,
             'poly': poly_loss,
-            'cls_loss': cls_loss,
-            'line_iou': line_iou_loss
+            'cls_loss': cls_loss
         }

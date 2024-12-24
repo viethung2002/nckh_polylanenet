@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+from torchvision.ops import FeaturePyramidNetwork
 from collections import OrderedDict
-from lib.papfn import PathAggregationFeaturePyramidNetwork
 
 
 class OutputLayer(nn.Module):
@@ -93,12 +93,12 @@ class PolyRegression(nn.Module):
         # Initialize backbone
         self.model = self._initialize_backbone(backbone, num_outputs, pretrained, extra_outputs)
 
-        # Adjust Path Aggregation Pyramid Network (PAPFN)
-        in_channels_list = [16, 24, 32, 96]  # Các kênh tương ứng với các stage của backbone
-        self.papfn = PathAggregationFeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=256)
+        # Adjust Feature Pyramid Network
+        in_channels_list = [16, 24, 32, 96]  # Corrected channels from mobilenet_v2
+        self.fpn = FeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=256)
 
         # Output layers
-        self.papfn_output = nn.Conv2d(256, num_outputs, kernel_size=1)
+        self.fpn_output = nn.Conv2d(256, num_outputs, kernel_size=1)
         self.extra_output_layer = (
             nn.Conv2d(256, extra_outputs, kernel_size=1) if extra_outputs > 0 else None
         )
@@ -132,7 +132,7 @@ class PolyRegression(nn.Module):
         features = OrderedDict()
         for idx, layer in enumerate(self.model):
             x = layer(x)
-            # print(f"Backbone stage {idx} output shape: {x.shape}")  # Debugging output shape
+            print(f"Backbone stage {idx} output shape: {x.shape}")  # Debugging output shape
             features[str(idx)] = x
         return features
 
@@ -141,33 +141,33 @@ class PolyRegression(nn.Module):
         if self.use_flip_block:
             x = self.flip_block(x)
             x = self.channel_adapter(x)  # Adjust channels to match backbone input
-            # print(f"After channel adapter: {x.shape}")  # Debugging shape after channel adapter
+            print(f"After channel adapter: {x.shape}")  # Debugging shape after channel adapter
 
         # Extract features from backbone
         features = self._extract_backbone_features(x)
 
-        # Apply PAPFN
-        papfn_features = self.papfn(features)
+        # Apply FPN
+        fpn_features = self.fpn(features)
 
-        # Use top PAPFN output for regression
-        papfn_output = self.papfn_output(papfn_features["3"])
-        papfn_output = F.adaptive_avg_pool2d(papfn_output, (1, 1)).view(papfn_output.size(0), -1)
+        # Use top FPN output for regression
+        fpn_output = self.fpn_output(fpn_features["3"])
+        fpn_output = F.adaptive_avg_pool2d(fpn_output, (1, 1)).view(fpn_output.size(0), -1)
 
         # Compute extra outputs if needed
         extra_outputs = None
         if self.extra_outputs > 0:
-            extra_outputs = self.extra_output_layer(papfn_features["3"])
+            extra_outputs = self.extra_output_layer(fpn_features["3"])
             extra_outputs = F.adaptive_avg_pool2d(extra_outputs, (1, 1)).view(extra_outputs.size(0), -1)
 
         # Apply Self-Attention
-        papfn_output, _ = self.attention(papfn_output, papfn_output, papfn_output)
+        fpn_output, _ = self.attention(fpn_output, fpn_output, fpn_output)
 
         # Curriculum learning
         for i in range(len(self.curriculum_steps)):
             if epoch is not None and epoch < self.curriculum_steps[i]:
-                papfn_output[:, -len(self.curriculum_steps) + i] = 0
+                fpn_output[:, -len(self.curriculum_steps) + i] = 0
 
-        return papfn_output, extra_outputs
+        return fpn_output, extra_outputs
 
     def decode(self, all_outputs, labels, conf_threshold=0.5):
         outputs, extra_outputs = all_outputs
@@ -179,40 +179,8 @@ class PolyRegression(nn.Module):
         outputs[outputs[:, :, 0] < conf_threshold] = 0
 
         return outputs, extra_outputs
-    def line_iou_loss(self, pred_points, target_points, radius=0.1):
-        """
-        Calculate Line IoU Loss.
-        
-        :param pred_points: Predicted lane points (N x 2 or N x 1 for x coordinates)
-        :param target_points: Ground truth lane points (N x 2 or N x 1 for x coordinates)
-        :param radius: Radius for extending points into line segments.
-        :return: Line IoU Loss (1 - Line IoU)
-        """
-        # Ensure inputs are in the same shape
-        assert pred_points.shape == target_points.shape, "Shape mismatch between predictions and targets"
 
-        # Extend points into line segments
-        pred_start = pred_points - radius
-        pred_end = pred_points + radius
-        target_start = target_points - radius
-        target_end = target_points + radius
-
-        # Calculate intersection and union
-        intersection_start = torch.max(pred_start, target_start)
-        intersection_end = torch.min(pred_end, target_end)
-        intersection = torch.clamp(intersection_end - intersection_start, min=0)
-
-        union_start = torch.min(pred_start, target_start)
-        union_end = torch.max(pred_end, target_end)
-        union = torch.clamp(union_end - union_start, min=0)
-
-        iou = intersection / (union + 1e-7)  # Add epsilon to prevent division by zero
-        line_iou = iou.sum(dim=1) / pred_points.shape[1]  # Average IoU over all points
-
-        # Line IoU Loss
-        liou_loss = 1 - line_iou.mean()
-        return liou_loss
-    def focal_loss(self, pred_confs, target_confs, alpha=0.2, gamma=2.0):
+    def focal_loss(self, pred_confs, target_confs, alpha=0.25, gamma=2.0):
         """
         Focal Loss for binary classification.
 
@@ -233,18 +201,16 @@ class PolyRegression(nn.Module):
         return loss.mean()  # Average loss over the batch
 
     def loss(self,
-            outputs,
-            target,
-            conf_weight=1,
-            lower_weight=1,
-            upper_weight=1,
-            cls_weight=1,
-            poly_weight=300,
-            line_iou_weight=300,  # New weight for Line IoU Loss
-            threshold=15 / 720.):
+             outputs,
+             target,
+             conf_weight=1,
+             lower_weight=1,
+             upper_weight=1,
+             cls_weight=1,
+             poly_weight=300,
+             threshold=15 / 720.):
         pred, extra_outputs = outputs
         mse = nn.MSELoss()
-        bce = nn.BCELoss()
         s = nn.Sigmoid()
         threshold = nn.Threshold(threshold**2, 0.)
         pred = pred.reshape(-1, target.shape[1], 1 + 2 + 4)
@@ -292,29 +258,21 @@ class PolyRegression(nn.Module):
         poly_loss = threshold(
             (pred_xs[valid_xs] - target_xs[valid_xs])**2).sum() / (valid_lanes_idx.sum() * valid_xs.sum())
 
-        # Line IoU Loss calculation
-        pred_points = pred_xs.T  # Reshape to (N, points)
-        target_points = target_xs.T  # Reshape to (N, points)
-        line_iou_loss = self.line_iou_loss(pred_points, target_points)
-
         # Applying weights to partial losses
         poly_loss = poly_loss * poly_weight
         lower_loss = lower_loss * lower_weight
         upper_loss = upper_loss * upper_weight
         cls_loss = cls_loss * cls_weight
-        line_iou_loss = line_iou_loss * line_iou_weight
 
         # Focal loss for confidence prediction
-        # conf_loss = self.focal_loss(pred_confs, target_confs) * conf_weight
-        conf_loss = bce(pred_confs, target_confs) * conf_weight
+        conf_loss = self.focal_loss(pred_confs, target_confs) * conf_weight
 
-        loss = conf_loss + lower_loss + upper_loss + poly_loss + cls_loss + line_iou_loss
+        loss = conf_loss + lower_loss + upper_loss + poly_loss + cls_loss
 
         return loss, {
             'conf': conf_loss,
             'lower': lower_loss,
             'upper': upper_loss,
             'poly': poly_loss,
-            'cls_loss': cls_loss,
-            'line_iou': line_iou_loss
+            'cls_loss': cls_loss
         }

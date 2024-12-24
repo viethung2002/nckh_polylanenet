@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+from torchvision.ops import FeaturePyramidNetwork
 from collections import OrderedDict
-from lib.papfn import PathAggregationFeaturePyramidNetwork
 
 
 class OutputLayer(nn.Module):
@@ -93,12 +93,12 @@ class PolyRegression(nn.Module):
         # Initialize backbone
         self.model = self._initialize_backbone(backbone, num_outputs, pretrained, extra_outputs)
 
-        # Adjust Path Aggregation Pyramid Network (PAPFN)
-        in_channels_list = [16, 24, 32, 96]  # Các kênh tương ứng với các stage của backbone
-        self.papfn = PathAggregationFeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=256)
+        # Adjust Feature Pyramid Network
+        in_channels_list = [16, 24, 32, 96]  # Corrected channels from mobilenet_v2
+        self.fpn = FeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=256)
 
         # Output layers
-        self.papfn_output = nn.Conv2d(256, num_outputs, kernel_size=1)
+        self.fpn_output = nn.Conv2d(256, num_outputs, kernel_size=1)
         self.extra_output_layer = (
             nn.Conv2d(256, extra_outputs, kernel_size=1) if extra_outputs > 0 else None
         )
@@ -146,28 +146,28 @@ class PolyRegression(nn.Module):
         # Extract features from backbone
         features = self._extract_backbone_features(x)
 
-        # Apply PAPFN
-        papfn_features = self.papfn(features)
+        # Apply FPN
+        fpn_features = self.fpn(features)
 
-        # Use top PAPFN output for regression
-        papfn_output = self.papfn_output(papfn_features["3"])
-        papfn_output = F.adaptive_avg_pool2d(papfn_output, (1, 1)).view(papfn_output.size(0), -1)
+        # Use top FPN output for regression
+        fpn_output = self.fpn_output(fpn_features["3"])
+        fpn_output = F.adaptive_avg_pool2d(fpn_output, (1, 1)).view(fpn_output.size(0), -1)
 
         # Compute extra outputs if needed
         extra_outputs = None
         if self.extra_outputs > 0:
-            extra_outputs = self.extra_output_layer(papfn_features["3"])
+            extra_outputs = self.extra_output_layer(fpn_features["3"])
             extra_outputs = F.adaptive_avg_pool2d(extra_outputs, (1, 1)).view(extra_outputs.size(0), -1)
 
         # Apply Self-Attention
-        papfn_output, _ = self.attention(papfn_output, papfn_output, papfn_output)
+        fpn_output, _ = self.attention(fpn_output, fpn_output, fpn_output)
 
         # Curriculum learning
         for i in range(len(self.curriculum_steps)):
             if epoch is not None and epoch < self.curriculum_steps[i]:
-                papfn_output[:, -len(self.curriculum_steps) + i] = 0
+                fpn_output[:, -len(self.curriculum_steps) + i] = 0
 
-        return papfn_output, extra_outputs
+        return fpn_output, extra_outputs
 
     def decode(self, all_outputs, labels, conf_threshold=0.5):
         outputs, extra_outputs = all_outputs
@@ -179,6 +179,26 @@ class PolyRegression(nn.Module):
         outputs[outputs[:, :, 0] < conf_threshold] = 0
 
         return outputs, extra_outputs
+
+    def focal_loss(self, pred_confs, target_confs, alpha=0.25, gamma=2.0):
+        """
+        Focal Loss for binary classification.
+
+        :param pred_confs: Predicted confidences (sigmoid outputs).
+        :param target_confs: Target labels (0 or 1).
+        :param alpha: Balancing factor for the class imbalance (default=0.25).
+        :param gamma: Focusing parameter to reduce loss for easy examples (default=2.0).
+        :return: Focal loss value.
+        """
+        # Clip predictions to prevent log(0) errors
+        pred_confs = torch.clamp(pred_confs, min=1e-7, max=1 - 1e-7)
+
+        # Compute the focal loss
+        target_confs = target_confs.float()
+        cross_entropy_loss = -target_confs * torch.log(pred_confs) - (1 - target_confs) * torch.log(1 - pred_confs)
+        loss = alpha * ((1 - pred_confs) ** gamma) * cross_entropy_loss
+
+        return loss.mean()  # Average loss over the batch
     def line_iou_loss(self, pred_points, target_points, radius=0.1):
         """
         Calculate Line IoU Loss.
@@ -212,25 +232,6 @@ class PolyRegression(nn.Module):
         # Line IoU Loss
         liou_loss = 1 - line_iou.mean()
         return liou_loss
-    def focal_loss(self, pred_confs, target_confs, alpha=0.2, gamma=2.0):
-        """
-        Focal Loss for binary classification.
-
-        :param pred_confs: Predicted confidences (sigmoid outputs).
-        :param target_confs: Target labels (0 or 1).
-        :param alpha: Balancing factor for the class imbalance (default=0.25).
-        :param gamma: Focusing parameter to reduce loss for easy examples (default=2.0).
-        :return: Focal loss value.
-        """
-        # Clip predictions to prevent log(0) errors
-        pred_confs = torch.clamp(pred_confs, min=1e-7, max=1 - 1e-7)
-
-        # Compute the focal loss
-        target_confs = target_confs.float()
-        cross_entropy_loss = -target_confs * torch.log(pred_confs) - (1 - target_confs) * torch.log(1 - pred_confs)
-        loss = alpha * ((1 - pred_confs) ** gamma) * cross_entropy_loss
-
-        return loss.mean()  # Average loss over the batch
 
     def loss(self,
             outputs,
@@ -240,11 +241,10 @@ class PolyRegression(nn.Module):
             upper_weight=1,
             cls_weight=1,
             poly_weight=300,
-            line_iou_weight=300,  # New weight for Line IoU Loss
+            line_iou_weight=0.5,  # New weight for Line IoU Loss
             threshold=15 / 720.):
         pred, extra_outputs = outputs
         mse = nn.MSELoss()
-        bce = nn.BCELoss()
         s = nn.Sigmoid()
         threshold = nn.Threshold(threshold**2, 0.)
         pred = pred.reshape(-1, target.shape[1], 1 + 2 + 4)
@@ -305,8 +305,7 @@ class PolyRegression(nn.Module):
         line_iou_loss = line_iou_loss * line_iou_weight
 
         # Focal loss for confidence prediction
-        # conf_loss = self.focal_loss(pred_confs, target_confs) * conf_weight
-        conf_loss = bce(pred_confs, target_confs) * conf_weight
+        conf_loss = self.focal_loss(pred_confs, target_confs) * conf_weight
 
         loss = conf_loss + lower_loss + upper_loss + poly_loss + cls_loss + line_iou_loss
 
