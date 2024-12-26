@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import tempfile
 
 import numpy as np
 from tabulate import tabulate
@@ -104,6 +105,7 @@ class TuSimple(object):
         return json.dumps(output)
 
     def save_tusimple_predictions(self, predictions, runtimes, filename):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)  # Ensure the directory exists
         lines = []
         for idx in range(len(predictions)):
             line = self.pred2tusimpleformat(idx, predictions[idx], runtimes[idx])
@@ -112,7 +114,8 @@ class TuSimple(object):
             output_file.write('\n'.join(lines))
 
     def eval(self, exp_dir, predictions, runtimes, label=None, only_metrics=False):
-        pred_filename = '/tmp/tusimple_predictions_{}.json'.format(label)
+        # Use a valid directory for saving predictions
+        pred_filename = os.path.join(exp_dir, 'tusimple_predictions_{}.json'.format(label))
         self.save_tusimple_predictions(predictions, runtimes, pred_filename)
         if self.metric == 'default':
             result = json.loads(LaneEval.bench_one_submit(pred_filename, self.anno_files[0]))

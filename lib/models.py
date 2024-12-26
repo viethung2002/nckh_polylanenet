@@ -6,22 +6,28 @@ from collections import OrderedDict
 from lib.papfn import PathAggregationFeaturePyramidNetwork
 
 
-class OutputLayer(nn.Module):
-    def __init__(self, fc, num_extra):
-        super(OutputLayer, self).__init__()
-        self.regular_outputs_layer = fc
-        self.num_extra = num_extra
-        if num_extra > 0:
-            self.extra_outputs_layer = nn.Linear(fc.in_features, num_extra)
+feature_maps = {}
 
-    def forward(self, x):
-        regular_outputs = self.regular_outputs_layer(x)
-        if self.num_extra > 0:
-            extra_outputs = self.extra_outputs_layer(x)
-        else:
-            extra_outputs = None
-        return regular_outputs, extra_outputs
+def hook_fn(module, input, output):
+    """
+    Hàm hook để lưu output của module.
+    """
+    feature_maps[module] = output  # Lưu output (Feature Map) vào một từ điển.
 
+def visualize_feature_map(feature_map, num_filters=8):
+    """
+    Hiển thị một số Feature Map.
+    """
+    # Chọn số lượng filters để hiển thị
+    num_filters = min(num_filters, feature_map.size(1))
+    feature_map = feature_map[0, :num_filters].detach().cpu()  # Chọn batch đầu tiên và chuyển sang CPU
+
+    # Vẽ các feature map
+    fig, axes = plt.subplots(1, num_filters, figsize=(15, 15))
+    for i, ax in enumerate(axes):
+        ax.imshow(feature_map[i], cmap='viridis')
+        ax.axis('off')
+    plt.show()
 
 class SelfAttention(nn.Module):
     def __init__(self, embed_size, heads):
@@ -212,25 +218,7 @@ class PolyRegression(nn.Module):
         # Line IoU Loss
         liou_loss = 1 - line_iou.mean()
         return liou_loss
-    def focal_loss(self, pred_confs, target_confs, alpha=0.2, gamma=2.0):
-        """
-        Focal Loss for binary classification.
 
-        :param pred_confs: Predicted confidences (sigmoid outputs).
-        :param target_confs: Target labels (0 or 1).
-        :param alpha: Balancing factor for the class imbalance (default=0.25).
-        :param gamma: Focusing parameter to reduce loss for easy examples (default=2.0).
-        :return: Focal loss value.
-        """
-        # Clip predictions to prevent log(0) errors
-        pred_confs = torch.clamp(pred_confs, min=1e-7, max=1 - 1e-7)
-
-        # Compute the focal loss
-        target_confs = target_confs.float()
-        cross_entropy_loss = -target_confs * torch.log(pred_confs) - (1 - target_confs) * torch.log(1 - pred_confs)
-        loss = alpha * ((1 - pred_confs) ** gamma) * cross_entropy_loss
-
-        return loss.mean()  # Average loss over the batch
 
     def loss(self,
             outputs,
@@ -240,7 +228,7 @@ class PolyRegression(nn.Module):
             upper_weight=1,
             cls_weight=1,
             poly_weight=300,
-            line_iou_weight=300,  # New weight for Line IoU Loss
+            line_iou_weight=0.5,  # New weight for Line IoU Loss
             threshold=15 / 720.):
         pred, extra_outputs = outputs
         mse = nn.MSELoss()

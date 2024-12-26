@@ -1,7 +1,38 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
+from collections import OrderedDict
+from lib.papfn import PathAggregationFeaturePyramidNetwork
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
 from torchvision.models import resnet34, resnet50, resnet101
 from efficientnet_pytorch import EfficientNet
+
+
+feature_maps = {}
+
+def hook_fn(module, input, output):
+    """
+    Hàm hook để lưu output của module.
+    """
+    feature_maps[module] = output  # Lưu output (Feature Map) vào một từ điển.
+
+def visualize_feature_map(feature_map, num_filters=8):
+    """
+    Hiển thị một số Feature Map.
+    """
+    # Chọn số lượng filters để hiển thị
+    num_filters = min(num_filters, feature_map.size(1))
+    feature_map = feature_map[0, :num_filters].detach().cpu()  # Chọn batch đầu tiên và chuyển sang CPU
+
+    # Vẽ các feature map
+    fig, axes = plt.subplots(1, num_filters, figsize=(15, 15))
+    for i, ax in enumerate(axes):
+        ax.imshow(feature_map[i], cmap='viridis')
+        ax.axis('off')
+    plt.show()
 
 
 class OutputLayer(nn.Module):
@@ -36,7 +67,7 @@ class PolyRegression(nn.Module):
             if pretrained:
                 self.model = EfficientNet.from_pretrained(backbone, num_classes=num_outputs)
             else:
-                self.model = EfficientNet.from_name(backbone, override_params={'num_classes': num_outputs})
+                self.model = EfficientNet.from_name(backbone, num_classes=num_outputs)
             self.model._fc = OutputLayer(self.model._fc, extra_outputs)
         elif backbone == 'resnet34':
             self.model = resnet34(pretrained=pretrained)

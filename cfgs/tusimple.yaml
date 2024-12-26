@@ -19,7 +19,7 @@ loss_parameters:
   upper_weight: 1
   cls_weight: 0
   poly_weight: 1000
-batch_size: 16
+batch_size: 1
 epochs: 2695
 optimizer:
   name: Adam
@@ -56,7 +56,7 @@ datasets:
          parameters:
            width: 1152
            height: 648
-      root: "../tusimple/TUSimple/train_set"
+      root: "D:/manga/nckh_polylanenet/TUSimple/train_set"
 
   test: &test
     type: LaneDataset
@@ -65,7 +65,8 @@ datasets:
       split: val
       max_lanes: 5
       img_size: [360, 640]
-      root: "../tusimple/TUSimple/train_set"
+      root: "D:/manga/nckh_polylanenet/TUSimple/train_set"
+      # D:\manga\nckh_polylanenet\TUSimple\train_set
       normalize: true
       augmentations: []
 

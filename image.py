@@ -111,7 +111,7 @@ if __name__ == "__main__":
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = cfg.get_model().to(device)
     test_parameters = cfg.get_test_parameters()
-    epoch = 281
+    epoch = 10
     if epoch > 0:
         model_path = os.path.join(exp_root, "models", f"model_{epoch:03d}.pt")
         model.load_state_dict(torch.load(model_path, map_location=device)['model'])

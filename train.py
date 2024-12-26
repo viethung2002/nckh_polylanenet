@@ -194,7 +194,7 @@ def setup_exp_dir(exps_dir, exp_name, cfg_path):
         os.makedirs(os.path.join(exp_root, dirname), exist_ok=True)
 
     shutil.copyfile(cfg_path, os.path.join(exp_root, 'config.yaml'))
-    with open(os.path.join(exp_root, 'code_state.txt'), 'w') as file:
+    with open(os.path.join(exp_root, 'code_state.txt'), 'w', encoding='utf-8') as file:  # Specify encoding as 'utf-8'
         file.write(get_code_state())
 
     return exp_root

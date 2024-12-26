@@ -212,25 +212,7 @@ class PolyRegression(nn.Module):
         # Line IoU Loss
         liou_loss = 1 - line_iou.mean()
         return liou_loss
-    def focal_loss(self, pred_confs, target_confs, alpha=0.2, gamma=2.0):
-        """
-        Focal Loss for binary classification.
 
-        :param pred_confs: Predicted confidences (sigmoid outputs).
-        :param target_confs: Target labels (0 or 1).
-        :param alpha: Balancing factor for the class imbalance (default=0.25).
-        :param gamma: Focusing parameter to reduce loss for easy examples (default=2.0).
-        :return: Focal loss value.
-        """
-        # Clip predictions to prevent log(0) errors
-        pred_confs = torch.clamp(pred_confs, min=1e-7, max=1 - 1e-7)
-
-        # Compute the focal loss
-        target_confs = target_confs.float()
-        cross_entropy_loss = -target_confs * torch.log(pred_confs) - (1 - target_confs) * torch.log(1 - pred_confs)
-        loss = alpha * ((1 - pred_confs) ** gamma) * cross_entropy_loss
-
-        return loss.mean()  # Average loss over the batch
 
     def loss(self,
             outputs,
